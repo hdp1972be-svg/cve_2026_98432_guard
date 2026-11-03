@@ -2,7 +2,7 @@
 
 **Status:** Temporary mitigation — not a permanent fix  
 **Platform tested:** Linux / Ubuntu 20.04 (should work upwards)
-**Kernel tested:** `5.15.0-124-generic` (should work upwards)
+**Kernel tested:** `5.15.0-124-generic` (Expected to work on newer Linux kernels providing the required eBPF and generic XDP functionality. Compatibility must be verified on the target kernel.)
 **Implementation:** eBPF XDP, generic (SKB) mode  
 **Date:** 2026-11-03
 
@@ -103,6 +103,46 @@ The actual implementation also handles up to two VLAN tags.
 | Incomplete/truncated IPv4 header | PASS |
 
 The implementation does not parse TCP options. TCP timestamps, SACK and window scaling are not IPv4 header options and remain unaffected.
+
+## 3. Why XDP instead of Netfilter or iptables?
+
+This mitigation uses **XDP (eXpress Data Path)** rather than Netfilter/iptables because the objective is to discard matching packets as early as reasonably possible in the Linux networking receive path.
+
+### Packet processing position
+
+With generic XDP (SKB mode), the filter runs at the ingress stage before the packet enters the normal network protocol stack and before Netfilter's usual IPv4 processing hooks.
+
+This has several advantages for this particular mitigation:
+
+- **Early rejection:** IPv4 TCP packets containing IPv4 header options are discarded before normal IPv4 and TCP processing.
+- **Reduced processing overhead:** Dropped packets do not continue through subsequent networking layers, including the normal Netfilter processing path.
+- **Narrow execution scope:** The program only inspects Ethernet, optional VLAN headers and the relevant IPv4 header fields. It does not require connection tracking, NAT or firewall rule evaluation.
+- **Predictable filtering logic:** The decision is based on the IPv4 protocol field and IHL value, making the filter small and straightforward to audit.
+- **Independent deployment:** The mitigation is implemented as an eBPF program and does not require modifying existing iptables or nftables firewall rules.
+
+### Why not iptables or Netfilter?
+
+iptables and nftables are perfectly valid ways to implement this same filtering rule. In fact, Netfilter-based filtering is a legitimate alternative and may be preferable where an administrator already manages ingress filtering centrally through the firewall.
+
+However, those mechanisms operate later in the receive path than XDP generic mode.
+
+For this specific use case, filtering before normal IPv4/TCP processing is desirable because the vulnerability concerns the handling of IPv4 TCP packets carrying IPv4 header options.
+
+### Generic XDP (SKB mode)
+
+This project deliberately uses generic XDP rather than driver-specific native XDP.
+
+Generic XDP operates on the SKB-based receive path and therefore provides broader compatibility with network drivers that do not implement native XDP support.
+
+The trade-off is that generic XDP does not provide the same early execution point or performance characteristics as native driver-mode XDP. It should not be confused with hardware-offloaded XDP.
+
+### Design decision
+
+The choice of XDP is not based on the assumption that Netfilter is insecure or unsuitable.
+
+It is based on placing this particular packet filter as early as practical in the Linux receive path, while retaining broad compatibility through generic XDP.
+
+**The objective is to reject the relevant packet class before it reaches the vulnerable IPv4/TCP processing path, not to replace the host firewall.**
 
 ## 4. What this mitigation blocks
 
@@ -494,7 +534,7 @@ If this workaround saved you time, helped secure a system, or provided a useful 
 
 Donations are entirely voluntary and help cover development time, testing hardware, infrastructure and ongoing maintenance.
 
-Support can be done by BTC or TRC20 on 
+Support can be done by ETH, BTC or TRC20 on 
 ```
 [ ETH 0x3c4cc45af4bdd51c050c4e5d194764a9969eaf43 ]
 [ BTC bc1qm4kle4s2jvujjjfaxg2uatw868uv4ljafnaj80 ]
