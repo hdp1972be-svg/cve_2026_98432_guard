@@ -478,8 +478,6 @@ efc78963c6ba695fe83b350629eee01c811f234756549989f371d8e91601ea79  ./xdp_option_p
 
 **Integrity note:** SHA-256 checks detect accidental or unauthorised changes only when the expected manifest is trusted. They do not independently authenticate the author or origin of the files. For stronger provenance, retain a trusted copy of the manifest or sign it with GPG.
 
-The README itself is included in the manifest. Its own hash is therefore recorded in `SHA256SUMS`, rather than embedded inside the README.
-
 ## 12. License
 
 GPL-3.0-only LICENSE
@@ -497,9 +495,9 @@ If this workaround saved you time, helped secure a system, or provided a useful 
 Donations are entirely voluntary and help cover development time, testing hardware, infrastructure and ongoing maintenance.
 
 Support can be done by BTC or TRC20 on 
-
+```
 [ ETH 0x3c4cc45af4bdd51c050c4e5d194764a9969eaf43 ]
 [ BTC bc1qm4kle4s2jvujjjfaxg2uatw868uv4ljafnaj80 ]
-[ USDT TRC20 TFU3WS9Y39MhFkmR6sFFNdPD8yvziHM8nw ]
+[ USDT TRC20 TFU3WS9Y39MhFkmR6sFFNdPD8yvziHM8nw ] ```
 
 Thank you for supporting independent open-source development!
