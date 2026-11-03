@@ -104,7 +104,7 @@ The actual implementation also handles up to two VLAN tags.
 
 The implementation does not parse TCP options. TCP timestamps, SACK and window scaling are not IPv4 header options and remain unaffected.
 
-## 3. Why XDP instead of Netfilter or iptables?
+## 3b. Why XDP instead of Netfilter or iptables?
 
 This mitigation uses **XDP (eXpress Data Path)** rather than Netfilter/iptables because the objective is to discard matching packets as early as reasonably possible in the Linux networking receive path.
 
