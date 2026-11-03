@@ -1,0 +1,102 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR"
+
+CLANG="${CLANG:-clang}"
+CC="${CC:-gcc}"
+
+GUARD_SRC="cve_2026_98432_guard.c"
+GUARD_OBJ="cve_2026_98432_guard.o"
+PROBE_SRC="xdp_option_probe.c"
+PROBE_BIN="xdp_option_probe"
+CHECK_SCRIPT="check-bpf-support"
+
+TMP_GUARD=""
+TMP_PROBE=""
+
+cleanup() {
+    [[ -z "$TMP_GUARD" ]] || rm -f -- "$TMP_GUARD"
+    [[ -z "$TMP_PROBE" ]] || rm -f -- "$TMP_PROBE"
+}
+trap cleanup EXIT
+
+fail() {
+    echo "[ERROR] $*" >&2
+    exit 1
+}
+
+echo "=== CVE-2026-98432 XDP build ==="
+echo "Source directory: $SCRIPT_DIR"
+echo
+
+# 1. Check kernel capabilities
+[[ -f "$CHECK_SCRIPT" ]] || fail "Missing $CHECK_SCRIPT"
+
+echo "[1/4] Checking kernel BPF/XDP support..."
+
+CHECK_OUTPUT="$(bash "./$CHECK_SCRIPT" 2>&1)" || {
+    printf '%s\n' "$CHECK_OUTPUT"
+    fail "BPF capability check failed"
+}
+
+printf '%s\n' "$CHECK_OUTPUT"
+
+for config in CONFIG_BPF CONFIG_BPF_SYSCALL CONFIG_NET CONFIG_INET; do
+    grep -Eq "^\[OK\][[:space:]]+${config}[[:space:]]+enabled$" \
+        <<< "$CHECK_OUTPUT" ||
+        fail "$config is not enabled or could not be confirmed"
+done
+
+# 2. Check build dependencies
+echo
+echo "[2/4] Checking build dependencies..."
+
+command -v "$CLANG" >/dev/null 2>&1 ||
+    fail "Clang not found: $CLANG"
+
+command -v "$CC" >/dev/null 2>&1 ||
+    fail "GCC not found: $CC"
+
+echo "[OK] Clang found: $("$CLANG" --version | head -n 1)"
+echo "[OK] GCC found: $("$CC" --version | head -n 1)"
+echo "[INFO] BPF target support will be tested during compilation."
+
+# 3. Check source files
+echo
+echo "[3/4] Checking source files..."
+
+[[ -r "$GUARD_SRC" ]] || fail "Missing $GUARD_SRC"
+[[ -r "$PROBE_SRC" ]] || fail "Missing $PROBE_SRC"
+
+# Temporary outputs: don't overwrite existing binaries on failure.
+TMP_GUARD="$(mktemp "$SCRIPT_DIR/.guard.XXXXXX")"
+TMP_PROBE="$(mktemp "$SCRIPT_DIR/.probe.XXXXXX")"
+
+# 4. Compile
+echo
+echo "[4/4] Compiling..."
+
+"$CLANG" -O2 -g -target bpf -Wall -Wextra \
+    -c "$GUARD_SRC" \
+    -o "$TMP_GUARD"
+
+echo "[OK] eBPF object compiled"
+
+"$CC" -O2 -Wall -Wextra \
+    -o "$TMP_PROBE" "$PROBE_SRC"
+
+echo "[OK] Packet probe compiled"
+
+# Publish only after both compilations succeed.
+mv -f -- "$TMP_GUARD" "$GUARD_OBJ"
+TMP_GUARD=""
+
+mv -f -- "$TMP_PROBE" "$PROBE_BIN"
+TMP_PROBE=""
+
+echo
+echo "=== BUILD SUCCESSFUL ==="
+echo "eBPF object: $GUARD_OBJ"
+echo "Probe binary: $PROBE_BIN"

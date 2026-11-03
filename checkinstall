@@ -1,0 +1,249 @@
+#!/usr/bin/bash
+#
+# checkinstall.sh
+#
+# Verify CVE-2026-98432 XDP guard installation.
+#
+# Usage:
+#   sudo ./checkinstall.sh
+#
+
+set -uo pipefail
+
+PROG_PIN="/sys/fs/bpf/cve_2026_98432_guard"
+MAP_PIN="/sys/fs/bpf/cve_2026_98432_stats"
+
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+RED='\033[0;31m'
+CYAN='\033[0;36m'
+RESET='\033[0m'
+
+ok()   { printf "${GREEN}[OK]${RESET}   %s\n" "$*"; }
+warn() { printf "${YELLOW}[WARN]${RESET} %s\n" "$*"; }
+fail() { printf "${RED}[FAIL]${RESET} %s\n" "$*"; }
+info() { printf "${CYAN}[INFO]${RESET} %s\n" "$*"; }
+
+ERRORS=0
+WARNINGS=0
+
+ATTACHED=0
+MISSING=0
+CONFLICTS=0
+TOTAL=0
+
+PROG_ID=""
+MAP_ID=""
+
+# --------------------------------------------------
+# Root and dependencies
+# --------------------------------------------------
+
+if [[ $EUID -ne 0 ]]; then
+    echo "Run as root: sudo $0"
+    exit 1
+fi
+
+for cmd in bpftool mountpoint grep awk; do
+    if ! command -v "$cmd" >/dev/null 2>&1; then
+        fail "Required command missing: $cmd"
+        exit 1
+    fi
+done
+
+echo
+echo "=============================================="
+echo "       CVE-2026-98432 XDP GUARD CHECK"
+echo "=============================================="
+echo
+
+# --------------------------------------------------
+# BPF filesystem
+# --------------------------------------------------
+
+if mountpoint -q /sys/fs/bpf; then
+    ok "BPF filesystem mounted"
+else
+    fail "BPF filesystem not mounted"
+    ((ERRORS++))
+fi
+
+# --------------------------------------------------
+# Pinned XDP program
+# --------------------------------------------------
+
+echo
+info "Checking pinned XDP program"
+echo
+
+if [[ -e "$PROG_PIN" ]]; then
+    PROG_INFO="$(bpftool prog show pinned "$PROG_PIN" 2>/dev/null || true)"
+
+    if [[ -n "$PROG_INFO" ]]; then
+        PROG_ID="${PROG_INFO%%:*}"
+
+        ok "Program pinned: $PROG_PIN"
+        info "Program ID: $PROG_ID"
+        info "$PROG_INFO"
+    else
+        fail "Pinned program exists but cannot be read"
+        ((ERRORS++))
+    fi
+else
+    fail "Program pin missing: $PROG_PIN"
+    ((ERRORS++))
+fi
+
+# --------------------------------------------------
+# Pinned statistics map
+# --------------------------------------------------
+
+echo
+info "Checking statistics map"
+echo
+
+if [[ -e "$MAP_PIN" ]]; then
+    MAP_INFO="$(bpftool map show pinned "$MAP_PIN" 2>/dev/null || true)"
+
+    if [[ -n "$MAP_INFO" ]]; then
+        MAP_ID="${MAP_INFO%%:*}"
+
+        ok "Statistics map pinned: $MAP_PIN"
+        info "Map ID: $MAP_ID"
+        info "$MAP_INFO"
+
+        if [[ -n "$PROG_INFO" ]] &&
+           grep -Eq "map_ids.*(^|[ ,])${MAP_ID}([ ,]|$)" <<< "$PROG_INFO"; then
+            ok "Statistics map belongs to the pinned program"
+        else
+            warn "Statistics map ID not found in program map_ids"
+            ((WARNINGS++))
+        fi
+    else
+        fail "Statistics map exists but cannot be read"
+        ((ERRORS++))
+    fi
+else
+    fail "Statistics map missing: $MAP_PIN"
+    ((ERRORS++))
+fi
+
+# --------------------------------------------------
+# Interface attachments
+# --------------------------------------------------
+
+echo
+info "Checking XDP attachments"
+echo
+
+for path in /sys/class/net/*; do
+    [[ -e "$path" ]] || continue
+
+    IFACE="${path##*/}"
+
+    [[ "$IFACE" == "lo" ]] && continue
+
+    ((TOTAL++))
+
+    OUTPUT="$(bpftool net show dev "$IFACE" 2>/dev/null || true)"
+
+    IDS="$(grep -Eo '(generic|xdpdrv|xdpoffload) id [0-9]+' \
+        <<< "$OUTPUT" || true)"
+
+    if [[ -z "$IDS" ]]; then
+        fail "$IFACE: no XDP program attached"
+        ((MISSING++))
+        ((ERRORS++))
+        continue
+    fi
+
+    FOUND_EXPECTED=0
+
+    while IFS= read -r ATTACHMENT; do
+        [[ -z "$ATTACHMENT" ]] && continue
+
+        ID="${ATTACHMENT##*id }"
+
+        if [[ -n "$PROG_ID" && "$ID" == "$PROG_ID" ]]; then
+            ok "$IFACE: $ATTACHMENT (expected program)"
+            FOUND_EXPECTED=1
+        else
+            warn "$IFACE: unexpected XDP attachment: $ATTACHMENT"
+            ((CONFLICTS++))
+        fi
+    done <<< "$IDS"
+
+    if (( FOUND_EXPECTED )); then
+        ((ATTACHED++))
+    else
+        fail "$IFACE: expected program ID $PROG_ID not attached"
+        ((MISSING++))
+        ((ERRORS++))
+    fi
+done
+
+# --------------------------------------------------
+# Statistics
+# --------------------------------------------------
+
+echo
+info "XDP statistics"
+echo
+
+if [[ -e "$MAP_PIN" ]]; then
+    if STATS="$(bpftool map dump pinned "$MAP_PIN" 2>&1)"; then
+        printf '%s\n' "$STATS"
+    else
+        warn "Unable to read statistics map"
+        printf '%s\n' "$STATS"
+        ((WARNINGS++))
+    fi
+else
+    warn "Statistics unavailable: map not pinned"
+fi
+
+# --------------------------------------------------
+# Summary
+# --------------------------------------------------
+
+echo
+echo "=============================================="
+echo "                  SUMMARY"
+echo "=============================================="
+
+printf "Program ID          : %s\n" "${PROG_ID:-UNKNOWN}"
+printf "Statistics map ID   : %s\n" "${MAP_ID:-UNKNOWN}"
+printf "Interfaces found    : %d\n" "$TOTAL"
+printf "Correct attachments : %d\n" "$ATTACHED"
+printf "Missing attachments : %d\n" "$MISSING"
+printf "Other XDP programs  : %d\n" "$CONFLICTS"
+printf "Warnings            : %d\n" "$WARNINGS"
+printf "Errors              : %d\n" "$ERRORS"
+
+echo "=============================================="
+
+if (( ERRORS == 0 && WARNINGS == 0 && CONFLICTS == 0 )); then
+    ok "INSTALLATION HEALTHY"
+elif (( ERRORS == 0 )); then
+    warn "INSTALLATION ACTIVE WITH WARNINGS"
+else
+    fail "INSTALLATION PROBLEMS DETECTED"
+fi
+
+# --------------------------------------------------
+# Detailed attachment status
+# --------------------------------------------------
+
+echo
+info "Complete XDP attachment overview"
+echo
+
+bpftool net show
+
+echo
+
+if (( ERRORS > 0 )); then
+    exit 1
+fi
+
+exit 0

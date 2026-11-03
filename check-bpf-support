@@ -1,0 +1,93 @@
+#!/bin/bash
+set -u
+
+KERNEL="$(uname -r)"
+CONFIG="/boot/config-${KERNEL}"
+
+echo "=== Kernel BPF/XDP capability check ==="
+echo "Kernel: ${KERNEL}"
+echo
+
+if [[ -r "$CONFIG" ]]; then
+echo "Config source: $CONFIG"
+elif [[ -r /proc/config.gz ]]; then
+echo "Config source: /proc/config.gz"
+CONFIG="/proc/config.gz"
+else
+echo "[ERROR] Kernel configuration unavailable"
+echo "Check /boot/config-${KERNEL} or /proc/config.gz"
+exit 1
+fi
+
+get_config() {
+local key="$1"
+if [[ "$CONFIG" == *.gz ]]; then
+zgrep -E "^${key}=" "$CONFIG" 2>/dev/null | cut -d= -f2
+else
+grep -E "^${key}=" "$CONFIG" 2>/dev/null | cut -d= -f2
+fi
+}
+
+check() {
+local key="$1"
+local value
+value="$(get_config "$key")"
+
+if [[ "$value" == "y" ]]; then
+    printf "[OK]      %-25s enabled\n" "$key"
+elif [[ "$value" == "m" ]]; then
+    printf "[MODULE]  %-25s module\n" "$key"
+elif [[ -z "$value" ]]; then
+    printf "[UNKNOWN] %-25s not found\n" "$key"
+else
+    printf "[MISSING] %-25s %s\n" "$key" "$value"
+fi
+
+}
+
+check CONFIG_BPF
+check CONFIG_BPF_SYSCALL
+check CONFIG_NET
+check CONFIG_INET
+check CONFIG_NETDEVICES
+check CONFIG_DEBUG_INFO_BTF
+check CONFIG_BPF_JIT
+
+echo
+echo "=== Runtime checks ==="
+
+if [[ -e /sys/fs/bpf ]]; then
+echo "[OK] BPF filesystem path exists"
+else
+echo "[MISSING] /sys/fs/bpf"
+fi
+
+if grep -qw bpf /proc/filesystems; then
+echo "[OK] BPF filesystem supported"
+else
+echo "[INFO] BPF filesystem not currently registered"
+fi
+
+if command -v bpftool >/dev/null 2>&1; then
+echo "[OK] bpftool installed"
+bpftool feature probe kernel 2>/dev/null | grep -Ei 'bpf|xdp' | head -20
+else
+echo "[INFO] bpftool not installed"
+fi
+
+echo
+echo "=== XDP generic mode ==="
+if [[ -d /sys/class/net ]]; then
+for iface in /sys/class/net/; do
+dev="${iface##/}"
+[[ "$dev" == "lo" ]] && continue
+echo "Interface: $dev"
+if command -v bpftool >/dev/null 2>&1; then
+bpftool net show dev "$dev" 2>/dev/null || true
+fi
+done
+fi
+
+echo
+echo "Note: CONFIG_BPF=y alone does not prove that XDP loading works."
+echo "A successful verifier load is the definitive functional test."

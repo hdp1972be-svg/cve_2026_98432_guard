@@ -1,0 +1,43 @@
+### Provided as-is
+
+This software is provided "AS IS", without warranty or guarantee of any kind.
+
+It is an experimental, temporary security mitigation intended to reduce exposure to a specific kernel attack surface. It is not a security patch, a kernel fix, or a replacement for vendor-provided security updates.
+
+### No guarantee of protection
+
+The authors make no guarantee that this software:
+
+- Prevents exploitation of CVE-2026-98432.
+- Eliminates all attack vectors associated with the vulnerability.
+- Detects or blocks every potentially malicious packet.
+- Provides complete protection across all network interfaces or kernel networking paths.
+- Is compatible with every Linux distribution, kernel version, network driver or hardware platform.
+- Will operate without disrupting network connectivity or other system functionality.
+
+The mitigation has a deliberately limited scope. Its effectiveness depends on correct compilation, kernel verification, successful attachment and coverage of the relevant ingress interfaces.
+
+### Deployment responsibility
+
+Users are responsible for:
+
+- Evaluating the suitability of the mitigation for their environment.
+- Testing it before production deployment.
+- Maintaining a working recovery and fallback procedure.
+- Verifying that the XDP program is attached to all relevant interfaces.
+- Monitoring system and network behaviour.
+- Installing the appropriate corrected kernel as soon as it becomes available.
+
+The authors accept no responsibility for service interruptions, network disruption, data loss, security incidents, system damage or other consequences arising from the use, modification or deployment of this software, to the extent permitted by applicable law.
+
+### No security certification
+
+This project has not been presented as a certified security product or independently audited security solution.
+
+The successful loading of an eBPF program by the kernel verifier establishes that the program satisfies the verifier's constraints. It does not establish that the mitigation completely prevents exploitation of the underlying vulnerability.
+
+### Final recommendation
+
+Install the vendor-supported kernel security fix as soon as possible.
+
+Once the corrected kernel has been deployed and validated, remove this temporary mitigation unless there is a separate operational reason to retain it.

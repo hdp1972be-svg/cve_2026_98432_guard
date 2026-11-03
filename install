@@ -1,0 +1,255 @@
+#!/bin/bash
+#
+# install
+#
+# Deploy and attach the CVE-2026-98432 XDP guard.
+#
+# Deployment directory:
+#   /etc/cve-2026-98432-guard
+#
+# Usage:
+#   sudo ./install [object-file]
+#
+# Existing unrelated XDP programs are never overwritten.
+
+set -Eeuo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_PATH="$(readlink -f -- "${BASH_SOURCE[0]}")"
+
+ETC_DIR="/etc/cve-2026-98432-guard"
+
+PROG_PIN="/sys/fs/bpf/cve_2026_98432_guard"
+MAP_PIN="/sys/fs/bpf/cve_2026_98432_stats"
+
+OBJECT_SOURCE="${1:-$SCRIPT_DIR/cve_2026_98432_guard.o}"
+OBJECT="$ETC_DIR/cve_2026_98432_guard.o"
+
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+RED='\033[0;31m'
+RESET='\033[0m'
+
+info()  { printf "${GREEN}[+]${RESET} %s\n" "$*"; }
+warn()  { printf "${YELLOW}[!]${RESET} %s\n" "$*"; }
+error() { printf "${RED}[-]${RESET} %s\n" "$*" >&2; }
+
+if [[ $EUID -ne 0 ]]; then
+    error "Run as root: sudo $0"
+    exit 1
+fi
+
+for cmd in ip bpftool mountpoint awk grep readlink cmp; do
+    if ! command -v "$cmd" >/dev/null 2>&1; then
+        error "Missing dependency: $cmd"
+        exit 1
+    fi
+done
+
+if [[ ! -f "$OBJECT_SOURCE" ]]; then
+    error "Object file not found: $OBJECT_SOURCE"
+    exit 1
+fi
+
+# --------------------------------------------------
+# Deploy files to /etc
+# --------------------------------------------------
+
+info "Deploying guard to $ETC_DIR"
+
+mkdir -p "$ETC_DIR"
+
+deploy_file() {
+    local source="$1"
+    local destination="$2"
+    local mode="$3"
+
+    [[ -f "$source" ]] || return 0
+
+    # Avoid copying a file onto itself.
+    if [[ -e "$destination" && "$source" -ef "$destination" ]]; then
+        return 0
+    fi
+
+    if [[ -e "$destination" ]] && cmp -s "$source" "$destination"; then
+        return 0
+    fi
+
+    /usr/bin/install -m "$mode" "$source" "$destination"
+    info "Deployed: $destination"
+}
+
+deploy_file "$OBJECT_SOURCE" "$OBJECT" 0644
+deploy_file "$SCRIPT_PATH" "$ETC_DIR/install" 0755
+
+if [[ -f "$SCRIPT_DIR/checkinstall.sh" ]]; then
+    deploy_file "$SCRIPT_DIR/checkinstall.sh" \
+        "$ETC_DIR/checkinstall.sh" 0755
+fi
+
+if [[ -f "$SCRIPT_DIR/README.md" ]]; then
+    deploy_file "$SCRIPT_DIR/README.md" \
+        "$ETC_DIR/README.md" 0644
+fi
+
+# --------------------------------------------------
+# BPF filesystem
+# --------------------------------------------------
+
+mkdir -p /sys/fs/bpf
+
+if ! mountpoint -q /sys/fs/bpf; then
+    info "Mounting BPF filesystem"
+    mount -t bpf bpf /sys/fs/bpf
+fi
+
+# --------------------------------------------------
+# Load or reuse pinned program
+# --------------------------------------------------
+
+if [[ -e "$PROG_PIN" ]]; then
+    info "Reusing pinned program: $PROG_PIN"
+else
+    info "Loading XDP program from $OBJECT"
+    bpftool prog load "$OBJECT" "$PROG_PIN" type xdp
+fi
+
+PROG_INFO="$(bpftool prog show pinned "$PROG_PIN")"
+PROG_ID="${PROG_INFO%%:*}"
+
+if [[ ! "$PROG_ID" =~ ^[0-9]+$ ]]; then
+    error "Could not determine program ID"
+    exit 1
+fi
+
+info "Program ID: $PROG_ID"
+
+# --------------------------------------------------
+# Statistics map
+# --------------------------------------------------
+
+MAP_ID="$(
+    awk '
+        /map_ids/ {
+            for (i=1; i<=NF; i++)
+                if ($i == "map_ids") {
+                    print $(i+1)
+                    exit
+                }
+        }
+    ' <<< "$PROG_INFO"
+)"
+
+if [[ "$MAP_ID" =~ ^[0-9]+$ ]]; then
+    if [[ -e "$MAP_PIN" ]]; then
+        EXISTING_MAP_INFO="$(bpftool map show pinned "$MAP_PIN" 2>/dev/null || true)"
+        EXISTING_MAP_ID="${EXISTING_MAP_INFO%%:*}"
+
+        if [[ "$EXISTING_MAP_ID" != "$MAP_ID" ]]; then
+            error "Statistics map pin refers to a different map!"
+            error "Program map ID: $MAP_ID"
+            error "Pinned map ID : ${EXISTING_MAP_ID:-UNKNOWN}"
+            exit 1
+        fi
+
+        info "Statistics map already pinned (ID $MAP_ID)"
+    else
+        bpftool map pin id "$MAP_ID" "$MAP_PIN"
+        info "Statistics map pinned: $MAP_PIN (ID $MAP_ID)"
+    fi
+else
+    warn "No map ID found in program information"
+fi
+
+# --------------------------------------------------
+# Attach XDP to interfaces
+# --------------------------------------------------
+
+echo
+info "Scanning network interfaces"
+echo
+
+ATTACHED=0
+ALREADY=0
+SKIPPED=0
+FAILED=0
+
+for path in /sys/class/net/*; do
+    [[ -e "$path" ]] || continue
+
+    IFACE="${path##*/}"
+
+    [[ "$IFACE" == "lo" ]] && continue
+
+    CURRENT="$(bpftool net show dev "$IFACE" 2>/dev/null || true)"
+
+    IDS="$(
+        grep -Eo '(generic|xdpdrv|xdpoffload) id [0-9]+' \
+            <<< "$CURRENT" || true
+    )"
+
+    if [[ -n "$IDS" ]]; then
+        FOUND_EXPECTED=0
+
+        while IFS= read -r ATTACHMENT; do
+            [[ -n "$ATTACHMENT" ]] || continue
+
+            CURRENT_ID="${ATTACHMENT##*id }"
+
+            if [[ "$CURRENT_ID" == "$PROG_ID" ]]; then
+                info "$IFACE: already attached ($ATTACHMENT)"
+                FOUND_EXPECTED=1
+            else
+                warn "$IFACE: another XDP program attached ($ATTACHMENT)"
+            fi
+        done <<< "$IDS"
+
+        if (( FOUND_EXPECTED )); then
+            ((ALREADY+=1))
+        else
+            warn "$IFACE: existing XDP attachment, not overwritten"
+            ((SKIPPED+=1))
+        fi
+
+        continue
+    fi
+
+    info "$IFACE: attaching generic XDP"
+
+    if ip link set dev "$IFACE" xdpgeneric pinned "$PROG_PIN"; then
+        info "$IFACE: attached successfully"
+        ((ATTACHED+=1))
+    else
+        error "$IFACE: attachment failed"
+        ((FAILED+=1))
+    fi
+done
+
+# --------------------------------------------------
+# Summary
+# --------------------------------------------------
+
+echo
+echo "=============================================="
+echo "       CVE-2026-98432 XDP GUARD"
+echo "=============================================="
+echo "Program ID       : $PROG_ID"
+echo "Program pin      : $PROG_PIN"
+echo "Object           : $OBJECT"
+echo "Statistics map   : $MAP_PIN"
+echo "New attachments  : $ATTACHED"
+echo "Already attached : $ALREADY"
+echo "Other XDP        : $SKIPPED"
+echo "Failed           : $FAILED"
+echo "=============================================="
+
+echo
+info "Current XDP attachments:"
+bpftool net show
+
+if (( FAILED > 0 )); then
+    error "Some interfaces could not be attached"
+    exit 1
+fi
+
+info "Deployment and attachment complete."
