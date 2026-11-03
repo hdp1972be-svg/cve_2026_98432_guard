@@ -498,6 +498,7 @@ Support can be done by BTC or TRC20 on
 ```
 [ ETH 0x3c4cc45af4bdd51c050c4e5d194764a9969eaf43 ]
 [ BTC bc1qm4kle4s2jvujjjfaxg2uatw868uv4ljafnaj80 ]
-[ USDT TRC20 TFU3WS9Y39MhFkmR6sFFNdPD8yvziHM8nw ] ```
+[ USDT TRC20 TFU3WS9Y39MhFkmR6sFFNdPD8yvziHM8nw ] 
+```
 
 Thank you for supporting independent open-source development!
