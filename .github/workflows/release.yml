@@ -46,9 +46,11 @@ jobs:
         run: |
           mkdir -p dist/${{ matrix.arch }}
           zig cc -target ${{ matrix.target }} -static -O2 \
+            -L/usr/lib -L/lib \
             -o dist/${{ matrix.arch }}/mtcp-guard-ctl \
             mtcp-guard-ctl.c -lbpf -lelf -lz
           zig cc -target ${{ matrix.target }} -static -O2 \
+            -L/usr/lib -L/lib \
             -o dist/${{ matrix.arch }}/mtcp-guardd \
             mtcp-guardd.c -lbpf -lelf -lz
 
