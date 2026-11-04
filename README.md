@@ -7,6 +7,52 @@
 **Date:** 2026-11-03
 
 ---
+## 0. Prerequisites
+
+### Kernel
+
+- Linux kernel **4.18 or later** (generic XDP / SKB mode support required)
+- eBPF syscall enabled (`CONFIG_BPF`, `CONFIG_BPF_SYSCALL`)
+- Networking stack enabled (`CONFIG_NET`, `CONFIG_INET`)
+
+Kernel config can be verified with:
+
+```bash
+grep -E 'CONFIG_BPF|CONFIG_BPF_SYSCALL|CONFIG_NET|CONFIG_INET' /boot/config-$(uname -r)
+```
+
+### Build toolchain
+
+- `clang` with BPF target support (`-target bpf`)
+- `gcc` (for userspace tools)
+- `bpftool` (for map pinning and inspection)
+- `pkg-config` and `libbpf` development headers (for `mtcp-guardd` and `mtcp-guard-ctl`)
+
+Install libbpf development headers:
+
+```bash
+# Debian / Ubuntu
+sudo apt install libbpf-dev
+
+# RHEL / Fedora
+sudo dnf install libbpf-devel
+```
+
+### Runtime
+
+- Root privileges (to load XDP programs and pin BPF maps)
+- BPF filesystem mounted at `/sys/fs/bpf`
+- `systemd` (for the `mtcp-guard` and `mtcp-guardd` services)
+
+### libbpf optional
+
+Userspace tools (`mtcp-guardd`, `mtcp-guard-ctl`) are only built when `libbpf` is
+found via `pkg-config`. If `libbpf` is absent, the build succeeds but only the
+eBPF object (`cve_2026_98432_guard.o`) and packet probe (`xdp_option_probe`)
+are produced. The daemon and config utility will not be available until
+`libbpf-dev` / `libbpf-devel` is installed and the build is re-run.
+
+---
 
 ## 1. Purpose
 
@@ -183,11 +229,11 @@ It also does not perform general IP packet validation. Incomplete or malformed p
 
 **Do not interpret a successful XDP deployment as proof that the host is no longer vulnerable.**
 
-## 6. Statistics
+## 6. Statistics and auxiliary maps
 
-The program uses a per-CPU array map:
+The program uses several pinned BPF maps in `/sys/fs/bpf/`:
 
-`cve_2026_98432_stats`
+### `cve_2026_98432_stats` — per-CPU statistics
 
 Map properties:
 
@@ -204,8 +250,70 @@ Counters:
 | 1 | Incomplete/truncated IPv4 headers passed |
 
 Because this is a per-CPU map, values are maintained separately for each CPU.
+A zero counter does not necessarily indicate a problem. It may simply mean
+that no matching traffic has been observed.
 
-A zero counter does not necessarily indicate a problem. It may simply mean that no matching traffic has been observed.
+### `cve_2026_98432_whitelist` — whitelist exact-match map
+
+Map properties:
+
+- Type: `hash`
+- Key size: 4 bytes (`__u32` source IP)
+- Value size: 1 byte (`__u8`)
+- Maximum entries: 512
+
+Exact-match whitelist of source IPv4 addresses. Entries here bypass the drop
+action entirely. Lookup order: bitmap fast path first, then this hash map.
+
+### `cve_2026_98432_whitelist_bm` — whitelist /24 bitmap fast path
+
+Map properties:
+
+- Type: `array`
+- Key size: 4 bytes (`__u32` /24 prefix index = src_ip >> 8)
+- Value size: 4 bytes (`__u32` bitmask)
+- Maximum entries: 256
+
+Bitmap fast path for /24 whitelist granularity. Each entry represents one /24
+prefix. Bit N in the bitmask covers source IPs where `((src_ip >> 3) & 0x1f) == N`.
+Consulted before the exact-match hash map.
+
+### `cve_2026_98432_drop_ips` — drop source IP tracker
+
+Map properties:
+
+- Type: `lru_hash`
+- Key size: 4 bytes (`__u32` source IP)
+- Value size: 8 bytes (`__u64` drop count)
+- Maximum entries: 4096
+
+LRU hash tracking how many times each source IP has been dropped. Incremented
+on every drop of a non-whitelisted packet with IPv4 options.
+
+### `cve_2026_98432_events` — userspace notification map
+
+Map properties:
+
+- Type: `perf_event_array`
+- Key size: 4 bytes
+- Value size: 4 bytes
+- Maximum entries: 1024
+
+Perf event buffer used to notify `mtcp-guardd` of each drop event. The daemon
+reads this map via `perf_buffer__poll()` (epoll-backed, event-driven).
+
+### `cve_2026_98432_config` — runtime configuration
+
+Map properties:
+
+- Type: `array`
+- Key size: 4 bytes
+- Value size: 4 bytes (`__u32` flags)
+- Maximum entries: 1
+
+Single-entry configuration map. Key 0 holds a flags word; bit 0 is the "wake"
+flag controlling whether drops are reported to the daemon.
+
 
 ## 7a Build
 
@@ -234,9 +342,18 @@ The expected output is:
 ```text
 cve_2026_98432_guard.o
 xdp_option_probe
+mtcp-guardd        (when libbpf is available)
+mtcp-guard-ctl     (when libbpf is available)
 ```
 
-This is the eBPF object loaded by the installer.
+`cve_2026_98432_guard.o` is the eBPF object loaded by the installer.
+
+`mtcp-guardd` is the userspace notification daemon. It reads the perf event
+buffer from `cve_2026_98432_events`, logs drop events via syslog, and supports
+SIGHUP configuration reload.
+
+`mtcp-guard-ctl` is the configuration utility for managing the whitelist,
+wake flag, statistics, and drop-IP tracking at runtime.
 
 ### Architecture portability
 
@@ -273,6 +390,11 @@ The pinned BPF objects are:
 ```text
 /sys/fs/bpf/cve_2026_98432_guard
 /sys/fs/bpf/cve_2026_98432_stats
+/sys/fs/bpf/cve_2026_98432_whitelist
+/sys/fs/bpf/cve_2026_98432_whitelist_bm
+/sys/fs/bpf/cve_2026_98432_drop_ips
+/sys/fs/bpf/cve_2026_98432_events
+/sys/fs/bpf/cve_2026_98432_config
 ```
 
 The installer:
@@ -427,52 +549,302 @@ After reboot:
 
 ### Automatic loading through systemd
 
-To make the mitigation reboot-safe, a systemd oneshot service can automatically deploy the filter during system startup.
+Two systemd units are provided:
 
-The service executes the installer:
+- `mtcp-guard.service` — oneshot service that runs the installer to deploy
+  the XDP filter at boot (reboot persistence for the filter).
+- `mtcp-guardd.service` — simple service that runs the `mtcp-guardd` userspace
+  daemon. It reads the perf event buffer from `cve_2026_98432_events` and logs
+  drop events via syslog. Supports `SIGHUP` for configuration reload.
 
-```text
-/etc/cve-2026-98432-guard/install
-```
-
-The service should be configured to run after the relevant network devices have been initialised and before normal network operation where practical.
-
-Example unit:
-
-### Enable the service
-
-Install the unit file:
+Install both unit files:
 
 ```bash
-sudo cp mtcp-guard.service \
-    /etc/systemd/system/cve-2026-98432-guard.service
+sudo install-service
 ```
 
-Enable it at boot:
+This installs `mtcp-guard.service` and `mtcp-guardd.service` into
+`/etc/systemd/system/`, reloads systemd, and enables both services.
+
+The `install-service` script (installed by the `install` step) places:
+
+- `/etc/systemd/system/mtcp-guard.service`
+- `/etc/systemd/system/mtcp-guardd.service`
+
+Enable both at boot:
 
 ```bash
 sudo systemctl daemon-reload
-sudo systemctl enable cve-2026-98432-guard.service
+sudo systemctl enable mtcp-guard.service
+sudo systemctl enable mtcp-guardd.service
 ```
 
-Start it immediately:
+Start both immediately:
 
 ```bash
-sudo systemctl start cve-2026-98432-guard.service
+sudo systemctl start mtcp-guard.service
+sudo systemctl start mtcp-guardd.service
 ```
+
+The `mtcp-guardd.service` unit is configured with `After=mtcp-guard.service`
+so the XDP filter is loaded before the daemon starts reading events.
+
+Install the unit files:
+
+```bash
+sudo install-service
+```
+
+Enable both at boot:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable mtcp-guard.service
+sudo systemctl enable mtcp-guardd.service
+```
+
+Start both immediately:
+
+```bash
+sudo systemctl start mtcp-guard.service
+sudo systemctl start mtcp-guardd.service
+```
+
+### mtcp-guardd — userspace notification daemon
+
+`mtcp-guardd` reads drop events from the `cve_2026_98432_events` perf event
+buffer using `perf_buffer__poll()` (epoll-backed, event-driven — no busy
+polling). Each drop event is logged via syslog:
+
+```
+drop src_ip=192.0.2.10 count=1
+```
+
+The daemon supports:
+
+| Flag/Event | Behavior |
+|---|---|
+| `-d` | Daemonize (fork into background) |
+| `SIGHUP` | Reload configuration from the `cve_2026_98432_config` map |
+| `SIGTERM` / `SIGINT` | Clean shutdown |
+| PID file | `/run/mtcp-guardd.pid` |
+
+The wake flag (bit 0 of key 0 in `cve_2026_98432_config`) controls whether
+drop events are reported to the daemon.
+
+### mtcp-guard-ctl — runtime configuration utility
+
+`mtcp-guard-ctl` manages whitelist entries, the wake flag, and statistics at
+runtime. It opens pinned maps via `bpf_obj_get`.
+
+Usage:
+
+```bash
+# Whitelist management
+./mtcp-guard-ctl whitelist add 192.0.2.10          # exact IP allow
+./mtcp-guard-ctl whitelist add 192.0.2.0 /24        # /24 prefix allow
+./mtcp-guard-ctl whitelist remove 192.0.2.10        # remove allow
+./mtcp-guard-ctl whitelist list                      # list all entries
+./mtcp-guard-ctl whitelist load /etc/cve-2026_98432_guard/whitelist.conf   # bulk-load from file
+./mtcp-guard-ctl whitelist save /etc/cve-2026_98432_guard/whitelist.conf   # dump maps to file
+
+# Wake flag
+./mtcp-guard-ctl wake on                             # enable daemon reporting
+./mtcp-guard-ctl wake off                            # disable daemon reporting
+
+# Statistics
+./mtcp-guard-ctl stats                               # show drop statistics
+./mtcp-guard-ctl drop-ips                            # show per-source drop counts
+```
+
+### Persistent whitelist (repopulation on reboot/reload)
+
+A whitelist configuration file is installed at:
+
+```
+/etc/cve-2026_98432_guard/whitelist.conf
+```
+
+Format: one entry per line, either a bare IP or a `/24` prefix. Lines starting
+with `#` are comments; blank lines are ignored.
+
+```
+# /etc/cve-2026_98432_guard/whitelist.conf
+192.0.2.10
+192.0.2.0/24
+10.0.0.5
+```
+
+The `mtcp-guardd.service` unit runs `ExecStartPre` to bulk-load this file into
+the BPF maps before the daemon starts:
+
+```
+ExecStartPre=/etc/cve-2026_98432-guard/mtcp-guard-ctl whitelist load /etc/cve-2026_98432_guard/whitelist.conf || true
+```
+
+This ensures whitelisted IPs are repopulated after every reboot (the BPF maps
+do not survive a kernel restart).
+
+Sending `SIGHUP` to the daemon (`systemctl reload mtcp-guardd.service`) also
+reloads `whitelist.conf`, so runtime whitelist changes can be applied by:
+
+1. Editing `/etc/cve-2026_98432_guard/whitelist.conf`
+2. Running `sudo systemctl reload mtcp-guardd.service`
+
+Alternatively, use `mtcp-guard-ctl whitelist add` / `remove` for live changes,
+then `mtcp-guard-ctl whitelist save` to persist them back to the file.
+
+### Whitelisting examples — common scenarios
+
+All `mtcp-guard-ctl` commands require root (they write to pinned BPF maps under
+`/sys/fs/bpf/`).
+
+#### Allow a single IP address
+
+```bash
+# Allow 192.0.2.10 (exact match via hash map)
+sudo ./mtcp-guard-ctl whitelist add 192.0.2.10
+
+# Verify
+sudo ./mtcp-guard-ctl whitelist list
+```
+
+Output:
+
+```text
+--- whitelist hash (exact IPs) ---
+192.0.2.10
+--- whitelist bitmap (/24 prefixes) ---
+(none)
+```
+
+#### Allow an entire /24 subnet
+
+```bash
+# Allow all hosts in 192.0.2.0/24 via the bitmap (fast path)
+sudo ./mtcp-guard-ctl whitelist add 192.0.2.0 /24
+```
+
+The bitmap uses `idx = src_ip >> 8` and `bit = 1 << ((src_ip >> 3) & 0x1f)`,
+so each /24 consumes one bit in a 256-entry array.
+
+#### Remove a single IP from the whitelist
+
+```bash
+sudo ./mtcp-guard-ctl whitelist remove 192.0.2.10
+```
+
+Note: `remove` only affects exact-IPS in the hash map. To remove a /24 prefix,
+clear the corresponding bitmap entry:
+
+```bash
+# Remove 192.0.2.0/24 from the bitmap
+sudo ./mtcp-guard-ctl whitelist add 192.0.2.0 /24   # (re-add to confirm current state)
+# Then edit the whitelist file and reload, or clear via direct map manipulation.
+```
+
+#### Bulk-load whitelist from a file
+
+Create `/etc/cve-2026_98432_guard/whitelist.conf`:
+
+```text
+# My whitelist
+192.0.2.10          # specific host
+192.0.2.0/24        # internal subnet
+10.0.0.5            # management host
+172.16.0.0/24       # another subnet
+```
+
+Load it:
+
+```bash
+sudo ./mtcp-guard-ctl whitelist load /etc/cve-2026_98432_guard/whitelist.conf
+```
+
+Any invalid lines are skipped with a warning; the command reports how many
+entries loaded and how many errored.
+
+#### Save current whitelist to a file
+
+Dump the live BPF maps to a file for backup or audit:
+
+```bash
+sudo ./mtcp-guard-ctl whitelist save /etc/cve-2026_98432_guard/whitelist.conf
+```
+
+This writes both the hash map entries (exact IPs) and bitmap entries (/24
+prefixes) in the config file format, so the file can be reloaded later.
+
+#### Live edit + persist workflow
+
+```bash
+# 1. Add a temporary allow
+sudo ./mtcp-guard-ctl whitelist add 198.51.100.99
+
+# 2. Verify it took effect
+sudo ./mtcp-guard-ctl whitelist list
+
+# 3. Persist to the config file
+sudo ./mtcp-guard-ctl whitelist save /etc/cve-2026_98432_guard/whitelist.conf
+
+# 4. Confirm the daemon picks it up on reload
+sudo systemctl reload mtcp-guardd.service
+```
+
+#### Enable / disable daemon reporting (wake flag)
+
+The wake flag (bit 0 of key 0 in `cve_2026_98432_config`) controls whether
+drop events are reported to `mtcp-guardd`:
+
+```bash
+sudo ./mtcp-guard-ctl wake on    # enable drop event reporting
+sudo ./mtcp-guard-ctl wake off   # disable drop event reporting
+```
+
+When reporting is disabled, drops still occur (XDP filter still active) but
+no perf events are emitted.
+
+#### View drop statistics
+
+```bash
+# Total drops (per-CPU stats map)
+sudo ./mtcp-guard-ctl stats
+
+# Per-source drop counts (LRU drop_ips map)
+sudo ./mtcp-guard-ctl drop-ips
+```
+
+#### Verify whitelisted traffic is not dropped
+
+1. Send a TCP packet with IPv4 options (IHL > 5) from a whitelisted IP.
+2. Check `journalctl | grep mtcp-guardd` — no drop event should appear.
+3. Check `./mtcp-guard-ctl stats` — drop counter should not increment.
 
 ### Service status and diagnostics
 
-Check the service:
+Check the XDP guard service:
 
 ```bash
-systemctl status cve-2026-98432-guard.service
+systemctl status mtcp-guard.service
+```
+
+Check the daemon service:
+
+```bash
+systemctl status mtcp-guardd.service
 ```
 
 Inspect startup logs:
 
 ```bash
-journalctl -u cve-2026-98432-guard.service -b
+journalctl -u mtcp-guard.service -b
+journalctl -u mtcp-guardd.service -b
+```
+
+Daemon drop events are logged to syslog and visible via:
+
+```bash
+journalctl | grep mtcp-guardd
 ```
 
 ### Important limitations
@@ -497,7 +869,44 @@ Additional udev or network-manager integration may be required for systems where
 
 **Conclusion:** The mitigation is reboot-safe only when the systemd service is installed, enabled and successfully executed at every boot. Without that service, the host returns to its unfiltered state after reboot.
 
-## 11. SHA-256 integrity checks
+## 11. Remove / Uninstall
+
+The `remove` script removes the runtime BPF filter only — it detaches XDP from all network interfaces, removes the pinned program and all pinned BPF maps, stops `mtcp-guardd.service`, and removes the PID file.
+
+It intentionally does **not** remove:
+
+- systemd unit files (`mtcp-guard.service`, `mtcp-guardd.service`)
+- `/etc/cve-2026_98432_guard/` directory (including `whitelist.conf`)
+
+### Usage
+
+```bash
+sudo ./remove
+```
+
+### What is removed
+
+| Item | Removed? | Notes |
+|---|---|---|
+| XDP attachments on all interfaces | Yes | Only interfaces with matching program ID |
+| Pinned program `/sys/fs/bpf/cve_2026_98432_guard` | Yes | |
+| Pinned map `stats` | Yes | |
+| Pinned map `whitelist` | Yes | |
+| Pinned map `whitelist_bm` | Yes | |
+| Pinned map `drop_ips` | Yes | |
+| Pinned map `events` | Yes | |
+| Pinned map `config` | Yes | |
+| `mtcp-guardd.service` (stopped) | Yes (stopped only) | Service file is kept |
+| `/run/mtcp-guardd.pid` | Yes | |
+| `/etc/systemd/system/mtcp-guard.service` | No | Kept |
+| `/etc/systemd/system/mtcp-guardd.service` | No | Kept |
+| `/etc/cve-2026_98432_guard/` | No | Kept (incl. whitelist.conf) |
+
+### Reboot note
+
+Pinned BPF objects exist only for the lifetime of the running kernel. A reboot will clear any remaining BPF state even if `remove` is not run.
+
+## 12. SHA-256 integrity checks
 
 The project includes a `SHA256SUMS` manifest containing SHA-256 hashes of the project files.
 

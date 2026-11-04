@@ -1,6 +1,19 @@
 #!/bin/bash
+set -e
+
+GUARD_DIR="/etc/cve-2026_98432_guard"
+
+sudo install -d -m 0755 "$GUARD_DIR"
+
 sudo install -m 0644 mtcp-guard.service \
     /etc/systemd/system/mtcp-guard.service
 
+sudo install -m 0644 mtcp-guardd.service \
+    /etc/systemd/system/mtcp-guardd.service
+
+sudo install -m 0644 whitelist.conf \
+    "$GUARD_DIR/whitelist.conf"
+
 sudo systemctl daemon-reload
 sudo systemctl enable --now mtcp-guard.service
+sudo systemctl enable --now mtcp-guardd.service

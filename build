@@ -1,46 +1,94 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
+# ---------------------------------------------------------------------------
+# Color support (only when stdout is a terminal)
+# ---------------------------------------------------------------------------
+if [[ -t 1 ]]; then
+    C_RED='\033[0;31m'
+    C_GREEN='\033[0;32m'
+    C_YELLOW='\033[0;33m'
+    C_BLUE='\033[0;34m'
+    C_RESET='\033[0m'
+else
+    C_RED=''
+    C_GREEN=''
+    C_YELLOW=''
+    C_BLUE=''
+    C_RESET=''
+fi
+
+ok()    { printf '%b[OK]%b %s\n'    "$C_GREEN" "$C_RESET" "$*"; }
+warn()  { printf '%b[WARN]%b %s\n'  "$C_YELLOW" "$C_RESET" "$*"; }
+info()  { printf '%b[INFO]%b %s\n'  "$C_BLUE" "$C_RESET" "$*"; }
+err()   { printf '%b[ERROR]%b %s\n' "$C_RED" "$C_RESET" "$*" >&2; }
+
+# ---------------------------------------------------------------------------
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
 CLANG="${CLANG:-clang}"
 CC="${CC:-gcc}"
 
+# ---------------------------------------------------------------------------
+# Kernel-version aware BPF helper ID selection.
+# bpf_perf_event_output helper ID varies across kernel versions:
+#   kernel < 5.0 : 26 (pre-5.0 enum layout)
+#   kernel >= 5.0: 25 (current stable UAPI layout)
+# Override with BPF_FUNC_PERF_EVENT_OUTPUT env var if needed.
+# ---------------------------------------------------------------------------
+KERNEL_MAJOR="$(uname -r | cut -d. -f1)"
+if [[ -n "${BPF_FUNC_PERF_EVENT_OUTPUT:-}" ]]; then
+    PERF_EVENT_OUTPUT_ID="${BPF_FUNC_PERF_EVENT_OUTPUT}"
+elif [[ "${KERNEL_MAJOR}" -ge 5 ]]; then
+    PERF_EVENT_OUTPUT_ID=25
+else
+    PERF_EVENT_OUTPUT_ID=26
+fi
+info "Detected kernel major: ${KERNEL_MAJOR}; using bpf_perf_event_output helper ID ${PERF_EVENT_OUTPUT_ID}"
+
 GUARD_SRC="cve_2026_98432_guard.c"
 GUARD_OBJ="cve_2026_98432_guard.o"
 PROBE_SRC="xdp_option_probe.c"
 PROBE_BIN="xdp_option_probe"
+DAEMON_SRC="mtcp-guardd.c"
+DAEMON_BIN="mtcp-guardd"
+CTL_SRC="mtcp-guard-ctl.c"
+CTL_BIN="mtcp-guard-ctl"
 CHECK_SCRIPT="check-bpf-support"
 
 TMP_GUARD=""
 TMP_PROBE=""
+TMP_DAEMON=""
+TMP_CTL=""
 
 cleanup() {
     [[ -z "$TMP_GUARD" ]] || rm -f -- "$TMP_GUARD"
     [[ -z "$TMP_PROBE" ]] || rm -f -- "$TMP_PROBE"
+    [[ -z "$TMP_DAEMON" ]] || rm -f -- "$TMP_DAEMON"
+    [[ -z "$TMP_CTL" ]] || rm -f -- "$TMP_CTL"
 }
 trap cleanup EXIT
 
 fail() {
-    echo "[ERROR] $*" >&2
+    err "$*"
     exit 1
 }
 
-echo "=== CVE-2026-98432 XDP build ==="
-echo "Source directory: $SCRIPT_DIR"
+echo "=== cve_2026_98432 XDP build ==="
+info "Source directory: $SCRIPT_DIR"
 echo
 
+# ---------------------------------------------------------------------------
 # 1. Check kernel capabilities
+# ---------------------------------------------------------------------------
 [[ -f "$CHECK_SCRIPT" ]] || fail "Missing $CHECK_SCRIPT"
 
 echo "[1/4] Checking kernel BPF/XDP support..."
-
 CHECK_OUTPUT="$(bash "./$CHECK_SCRIPT" 2>&1)" || {
     printf '%s\n' "$CHECK_OUTPUT"
     fail "BPF capability check failed"
 }
-
 printf '%s\n' "$CHECK_OUTPUT"
 
 for config in CONFIG_BPF CONFIG_BPF_SYSCALL CONFIG_NET CONFIG_INET; do
@@ -49,54 +97,95 @@ for config in CONFIG_BPF CONFIG_BPF_SYSCALL CONFIG_NET CONFIG_INET; do
         fail "$config is not enabled or could not be confirmed"
 done
 
+# ---------------------------------------------------------------------------
 # 2. Check build dependencies
+# ---------------------------------------------------------------------------
 echo
 echo "[2/4] Checking build dependencies..."
-
 command -v "$CLANG" >/dev/null 2>&1 ||
     fail "Clang not found: $CLANG"
-
 command -v "$CC" >/dev/null 2>&1 ||
     fail "GCC not found: $CC"
+ok "Clang found: $("$CLANG" --version | head -n 1)"
+ok "GCC found: $("$CC" --version | head -n 1)"
+info "BPF target support will be tested during compilation."
 
-echo "[OK] Clang found: $("$CLANG" --version | head -n 1)"
-echo "[OK] GCC found: $("$CC" --version | head -n 1)"
-echo "[INFO] BPF target support will be tested during compilation."
+# Optional libbpf check for userspace tools
+if command -v pkg-config >/dev/null 2>&1 && pkg-config --exists libbpf 2>/dev/null; then
+    ok "libbpf found (userspace tools will be built)"
+    HAVE_LIBBPF=1
+else
+    warn "libbpf not found via pkg-config; userspace tools (mtcp-guardd, mtcp-guard-ctl) will NOT be built"
+    warn "Install libbpf development headers and re-run:"
+    warn "  Debian/Ubuntu: sudo apt install libbpf-dev"
+    warn "  RHEL/Fedora:   sudo dnf install libbpf-devel"
+    HAVE_LIBBPF=0
+fi
 
+# ---------------------------------------------------------------------------
 # 3. Check source files
+# ---------------------------------------------------------------------------
 echo
 echo "[3/4] Checking source files..."
-
 [[ -r "$GUARD_SRC" ]] || fail "Missing $GUARD_SRC"
 [[ -r "$PROBE_SRC" ]] || fail "Missing $PROBE_SRC"
+if [[ "$HAVE_LIBBPF" -eq 1 ]]; then
+    [[ -r "$DAEMON_SRC" ]] || fail "Missing $DAEMON_SRC"
+    [[ -r "$CTL_SRC" ]] || fail "Missing $CTL_SRC"
+fi
 
 # Temporary outputs: don't overwrite existing binaries on failure.
 TMP_GUARD="$(mktemp "$SCRIPT_DIR/.guard.XXXXXX")"
 TMP_PROBE="$(mktemp "$SCRIPT_DIR/.probe.XXXXXX")"
 
+# ---------------------------------------------------------------------------
 # 4. Compile
+# ---------------------------------------------------------------------------
 echo
 echo "[4/4] Compiling..."
-
 "$CLANG" -O2 -g -target bpf -Wall -Wextra \
+    -DBPF_FUNC_PERF_EVENT_OUTPUT="${PERF_EVENT_OUTPUT_ID}" \
     -c "$GUARD_SRC" \
     -o "$TMP_GUARD"
-
-echo "[OK] eBPF object compiled"
+ok "eBPF object compiled"
 
 "$CC" -O2 -Wall -Wextra \
     -o "$TMP_PROBE" "$PROBE_SRC"
+ok "Packet probe compiled"
 
-echo "[OK] Packet probe compiled"
+if [[ "$HAVE_LIBBPF" -eq 1 ]]; then
+    TMP_DAEMON="$(mktemp "$SCRIPT_DIR/.daemon.XXXXXX")"
+    TMP_CTL="$(mktemp "$SCRIPT_DIR/.ctl.XXXXXX")"
 
-# Publish only after both compilations succeed.
+    "$CC" -O2 -Wall -Wextra \
+        -o "$TMP_DAEMON" "$DAEMON_SRC" -lbpf -lelf
+    ok "Daemon compiled: $DAEMON_BIN"
+
+    "$CC" -O2 -Wall -Wextra \
+        -o "$TMP_CTL" "$CTL_SRC" -lbpf -lelf
+    ok "Config utility compiled: $CTL_BIN"
+fi
+
+# ---------------------------------------------------------------------------
+# Publish only after all compilations succeed.
+# ---------------------------------------------------------------------------
 mv -f -- "$TMP_GUARD" "$GUARD_OBJ"
 TMP_GUARD=""
-
 mv -f -- "$TMP_PROBE" "$PROBE_BIN"
 TMP_PROBE=""
 
+if [[ "$HAVE_LIBBPF" -eq 1 ]]; then
+    mv -f -- "$TMP_DAEMON" "$DAEMON_BIN"
+    TMP_DAEMON=""
+    mv -f -- "$TMP_CTL" "$CTL_BIN"
+    TMP_CTL=""
+fi
+
 echo
-echo "=== BUILD SUCCESSFUL ==="
-echo "eBPF object: $GUARD_OBJ"
-echo "Probe binary: $PROBE_BIN"
+ok "BUILD SUCCESSFUL"
+info "eBPF object: $GUARD_OBJ"
+info "Probe binary: $PROBE_BIN"
+if [[ "$HAVE_LIBBPF" -eq 1 ]]; then
+    info "Daemon binary: $DAEMON_BIN"
+    info "Config utility: $CTL_BIN"
+fi

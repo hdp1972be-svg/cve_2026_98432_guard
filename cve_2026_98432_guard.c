@@ -40,6 +40,27 @@ typedef unsigned long long __u64;
 #define STAT_TCP_IP_OPTIONS_DROP  0
 #define STAT_MALFORMED_IPV4_PASS  1
 
+#define WHITELIST_HASH_ENTRIES  512
+#define WHITELIST_BM_ENTRIES    256
+#define DROP_IPS_LRU_ENTRIES    4096
+
+#define BPF_MAP_TYPE_UNSPEC             0
+#define BPF_MAP_TYPE_HASH               1
+#define BPF_MAP_TYPE_ARRAY              2
+#define BPF_MAP_TYPE_PERCPU_ARRAY       6
+#define BPF_MAP_TYPE_LRU_HASH           7
+#define BPF_MAP_TYPE_PERF_EVENT_ARRAY  14
+
+#define BPF_NOEXIST 1
+#define BPF_EXIST   2
+#define BPF_F_CURRENT_CPU 0xffffffffULL
+
+#define BPF_FUNC_map_lookup_elem     1
+#define BPF_FUNC_map_update_elem     2
+#ifndef BPF_FUNC_PERF_EVENT_OUTPUT
+#define BPF_FUNC_PERF_EVENT_OUTPUT 25
+#endif
+
 struct xdp_md {
     __u32 data;
     __u32 data_end;
@@ -80,9 +101,52 @@ struct {
     __type(value, __u64);
 } cve_2026_98432_stats SEC(".maps");
 
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, WHITELIST_HASH_ENTRIES);
+    __type(key, __u32);
+    __type(value, __u8);
+} cve_2026_98432_whitelist SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, WHITELIST_BM_ENTRIES);
+    __type(key, __u32);
+    __type(value, __u32);
+} cve_2026_98432_whitelist_bm SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, DROP_IPS_LRU_ENTRIES);
+    __type(key, __u32);
+    __type(value, __u64);
+} cve_2026_98432_drop_ips SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_PERF_EVENT_ARRAY);
+    __uint(max_entries, 1024);
+    __type(key, __u32);
+    __type(value, __u32);
+} cve_2026_98432_events SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, __u32);
+} cve_2026_98432_config SEC(".maps");
+
 /* BPF helper: bpf_map_lookup_elem, helper ID 1 */
 static void *(*bpf_map_lookup_elem)(void *map, const void *key) =
     (void *)1;
+
+static long (*bpf_map_update_elem)(void *map, const void *key,
+                                   const void *value, __u64 flags) =
+    (void *)2;
+
+static long (*bpf_perf_event_output)(void *ctx, void *map, __u64 flags,
+                                     void *data, __u64 size) =
+    (void *)BPF_FUNC_PERF_EVENT_OUTPUT;
 
 static __inline __u16 ntohs(__u16 value)
 {
@@ -97,6 +161,31 @@ static __inline void count_stat(__u32 key)
 
     if (counter)
         (*counter)++;
+}
+
+/* Whitelist lookup: bitmap fast path (/24) -> hash exact match */
+static __inline int is_whitelisted(__u32 src_ip)
+{
+    __u32 *bm;
+    __u32 idx;
+    __u32 bit;
+    __u8 *wl;
+
+    /* Bitmap fast path: index = /24 prefix, bit = group of 8 within /24 */
+    idx = src_ip >> 8;
+    bm = bpf_map_lookup_elem(&cve_2026_98432_whitelist_bm, &idx);
+    if (bm) {
+        bit = 1 << ((src_ip >> 3) & 0x1f);
+        if (*bm & bit)
+            return 1;
+    }
+
+    /* Hash fallback: exact IP match */
+    wl = bpf_map_lookup_elem(&cve_2026_98432_whitelist, &src_ip);
+    if (wl)
+        return 1;
+
+    return 0;
 }
 
 SEC("xdp")
@@ -184,6 +273,40 @@ int xdp_cve_2026_98432_guard(struct xdp_md *ctx)
      * TCP options are unaffected; they are in the TCP header.
      */
     if (ip->protocol == IPPROTO_TCP && ihl > 5) {
+        __u32 src_ip;
+        __u64 *cnt;
+        __u64 new_cnt = 1;
+
+        src_ip = ip->saddr;
+
+        if (is_whitelisted(src_ip))
+            return XDP_PASS;
+
+        /* Record drop source IP in hash */
+        cnt = bpf_map_lookup_elem(&cve_2026_98432_drop_ips, &src_ip);
+        if (cnt) {
+            new_cnt = *cnt + 1;
+            bpf_map_update_elem(&cve_2026_98432_drop_ips, &src_ip,
+                                &new_cnt, BPF_EXIST);
+        } else {
+            bpf_map_update_elem(&cve_2026_98432_drop_ips, &src_ip,
+                                &new_cnt, BPF_NOEXIST);
+        }
+
+        /* Notify userspace daemon via perf event buffer */
+        {
+            struct drop_event {
+                __u32 src_ip;
+                __u64 count;
+            } event = {};
+
+            event.src_ip = src_ip;
+            event.count = new_cnt;
+            bpf_perf_event_output(ctx, &cve_2026_98432_events,
+                                  BPF_F_CURRENT_CPU, &event,
+                                  sizeof(event));
+        }
+
         count_stat(STAT_TCP_IP_OPTIONS_DROP);
         return XDP_DROP;
     }

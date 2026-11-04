@@ -12,6 +12,11 @@ set -uo pipefail
 
 PROG_PIN="/sys/fs/bpf/cve_2026_98432_guard"
 MAP_PIN="/sys/fs/bpf/cve_2026_98432_stats"
+WHITELIST_PIN="/sys/fs/bpf/cve_2026_98432_whitelist"
+WHITELIST_BM_PIN="/sys/fs/bpf/cve_2026_98432_whitelist_bm"
+DROP_IPS_PIN="/sys/fs/bpf/cve_2026_98432_drop_ips"
+EVENTS_PIN="/sys/fs/bpf/cve_2026_98432_events"
+CONFIG_PIN="/sys/fs/bpf/cve_2026_98432_config"
 
 GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
@@ -126,7 +131,50 @@ if [[ -e "$MAP_PIN" ]]; then
 else
     fail "Statistics map missing: $MAP_PIN"
     ((ERRORS++))
-fi
+    fi
+
+# --------------------------------------------------
+# Map check helper
+# --------------------------------------------------
+
+check_map() {
+    local mname="$1"
+    local mpath="$2"
+    local minfo mid
+
+    echo
+    info "Checking $mname map"
+
+    if [[ -e "$mpath" ]]; then
+        minfo="$(bpftool map show pinned "$mpath" 2>/dev/null || true)"
+        if [[ -n "$minfo" ]]; then
+            mid="${minfo%%:*}"
+            ok "$mname map pinned: $mpath"
+            info "Map ID: $mid"
+            info "$minfo"
+
+            if [[ -n "$PROG_INFO" ]] &&
+               grep -Eq "map_ids.*(^|[ ,])${mid}([ ,]|$)" <<< "$PROG_INFO"; then
+                ok "$mname map belongs to the pinned program"
+            else
+                warn "$mname map ID not found in program map_ids"
+                ((<PII type="BIC_SWIFT" id="23"/>++))
+            fi
+        else
+            fail "$mname map exists but cannot be read"
+            ((ERRORS++))
+        fi
+    else
+        fail "$mname map missing: $mpath"
+        ((ERRORS++))
+    fi
+}
+
+check_map "whitelist"    "$WHITELIST_PIN"
+check_map "whitelist_bm" "$WHITELIST_BM_PIN"
+check_map "drop_ips"     "$DROP_IPS_PIN"
+check_map "events"       "$EVENTS_PIN"
+check_map "config"       "$CONFIG_PIN"
 
 # --------------------------------------------------
 # Interface attachments
@@ -214,11 +262,19 @@ echo "=============================================="
 printf "Program ID          : %s\n" "${PROG_ID:-UNKNOWN}"
 printf "Statistics map ID   : %s\n" "${MAP_ID:-UNKNOWN}"
 printf "Interfaces found    : %d\n" "$TOTAL"
-printf "Correct attachments : %d\n" "$ATTACHED"
+printf "Correct attachments : %d\n" "$<PII type="BIC_SWIFT" id="17"/>"
 printf "Missing attachments : %d\n" "$MISSING"
 printf "Other XDP programs  : %d\n" "$CONFLICTS"
-printf "Warnings            : %d\n" "$WARNINGS"
+printf "Warnings            : %d\n" "$<PII type="BIC_SWIFT" id="23"/>"
 printf "Errors              : %d\n" "$ERRORS"
+echo "----------------------------------------------"
+echo "Pinned maps:"
+echo "  stats   : $MAP_PIN"
+echo "  whitelist: $WHITELIST_PIN"
+echo "  whitelist_bm: $WHITELIST_BM_PIN"
+echo "  drop_ips : $DROP_IPS_PIN"
+echo "  events   : $EVENTS_PIN"
+echo "  config   : $CONFIG_PIN"
 
 echo "=============================================="
 

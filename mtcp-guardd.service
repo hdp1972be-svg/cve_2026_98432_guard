@@ -1,0 +1,17 @@
+[Unit]
+Description=mtcp-guard daemon (perf event consumer, syslog)
+Documentation=file:/etc/cve-2026-98432-guard/README.md
+Wants=mtcp-guard.service
+After=mtcp-guard.service network.target
+
+[Service]
+Type=simple
+ExecStartPre=/etc/cve-2026_98432-guard/mtcp-guard-ctl whitelist load /etc/cve-2026_98432_guard/whitelist.conf || true
+ExecStart=/etc/cve-2026_98432-guard/mtcp-guardd
+ExecReload=/bin/kill -HUP $MAINPID
+PIDFile=/run/mtcp-guardd.pid
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

@@ -92,6 +92,21 @@ if [[ -f "$SCRIPT_DIR/README.md" ]]; then
         "$ETC_DIR/README.md" 0644
 fi
 
+if [[ -f "$SCRIPT_DIR/mtcp-guardd" ]]; then
+    deploy_file "$SCRIPT_DIR/mtcp-guardd" \
+        "$ETC_DIR/mtcp-guardd" 0755
+fi
+
+if [[ -f "$SCRIPT_DIR/mtcp-guard-ctl" ]]; then
+    deploy_file "$SCRIPT_DIR/mtcp-guard-ctl" \
+        "$ETC_DIR/mtcp-guard-ctl" 0755
+fi
+
+if [[ -f "$SCRIPT_DIR/whitelist.conf" ]]; then
+    deploy_file "$SCRIPT_DIR/whitelist.conf" \
+        "$ETC_DIR/whitelist.conf" 0644
+fi
+
 # --------------------------------------------------
 # BPF filesystem
 # --------------------------------------------------
@@ -125,41 +140,98 @@ fi
 info "Program ID: $PROG_ID"
 
 # --------------------------------------------------
-# Statistics map
+# Statistics and auxiliary maps
 # --------------------------------------------------
 
-MAP_ID="$(
+# Map identification by characteristics:
+#   stats   : PERCPU_ARRAY  key=4 value=8  max_entries=2
+#   whitelist: HASH         key=4 value=1  max_entries=512
+#   whitelist_bm: ARRAY     key=4 value=4  max_entries=256
+#   drop_ips : LRU_HASH     key=4 value=8  max_entries=4096
+#   events   : PERF_EVENT_ARRAY key=4 value=4 max_entries=1024
+#   config   : ARRAY        key=4 value=4  max_entries=1
+
+MAP_NAMES="stats whitelist whitelist_bm drop_ips events config"
+MAP_PATHS=""
+for mname in $MAP_NAMES; do
+    MAP_PATHS="$MAP_PATHS /sys/fs/bpf/cve_2026_98432_$mname"
+done
+
+# Extract all map IDs from program info
+MAP_IDS="$(
     awk '
         /map_ids/ {
             for (i=1; i<=NF; i++)
                 if ($i == "map_ids") {
-                    print $(i+1)
+                    for (j=i+1; j<=NF; j++)
+                        print $j
                     exit
                 }
         }
     ' <<< "$PROG_INFO"
 )"
 
-if [[ "$MAP_ID" =~ ^[0-9]+$ ]]; then
-    if [[ -e "$MAP_PIN" ]]; then
-        EXISTING_MAP_INFO="$(bpftool map show pinned "$MAP_PIN" 2>/dev/null || true)"
-        EXISTING_MAP_ID="${EXISTING_MAP_INFO%%:*}"
+# Pin each map by matching characteristics
+pin_map_by_id() {
+    local map_id="$1"
+    local map_info
+    local map_type key_size value_size max_entries
+    local target=""
 
-        if [[ "$EXISTING_MAP_ID" != "$MAP_ID" ]]; then
-            error "Statistics map pin refers to a different map!"
-            error "Program map ID: $MAP_ID"
-            error "Pinned map ID : ${EXISTING_MAP_ID:-UNKNOWN}"
-            exit 1
+    map_info="$(bpftool map show id "$map_id" 2>/dev/null || true)"
+    [[ -z "$map_info" ]] && return 1
+
+    map_type="$(awk '/type/ {print $2}' <<< "$map_info")"
+    key_size="$(awk '/key/ {print $2}' <<< "$map_info")"
+    value_size="$(awk '/value/ {print $2}' <<< "$map_info")"
+    max_entries="$(awk '/max_entries/ {print $2}' <<< "$map_info")"
+
+    case "$map_type" in
+        percpu_array)
+            [[ "$key_size" == "4" && "$value_size" == "8" && "$max_entries" == "2" ]] && target="stats"
+            ;;
+        hash)
+            [[ "$key_size" == "4" && "$value_size" == "1" && "$max_entries" == "512" ]] && target="whitelist"
+            [[ "$key_size" == "4" && "$value_size" == "8" && "$max_entries" == "4096" ]] && target="drop_ips"
+            ;;
+        array)
+            [[ "$key_size" == "4" && "$value_size" == "4" && "$max_entries" == "256" ]] && target="whitelist_bm"
+            [[ "$key_size" == "4" && "$value_size" == "4" && "$max_entries" == "1" ]] && target="config"
+            ;;
+        perf_event_array)
+            [[ "$key_size" == "4" && "$value_size" == "4" && "$max_entries" == "1024" ]] && target="events"
+            ;;
+    esac
+
+    [[ -z "$target" ]] && {
+        warn "Unknown map (ID $map_id): type=$map_type key=$key_size value=$value_size max_entries=$max_entries"
+        return 0
+    }
+
+    local map_pin="/sys/fs/bpf/cve_2026_98432_$target"
+
+    if [[ -e "$map_pin" ]]; then
+        local existing
+        existing="$(bpftool map show pinned "$map_pin" 2>/dev/null || true)"
+        local existing_id="${existing%%:*}"
+        if [[ "$existing_id" == "$map_id" ]]; then
+            info "$target map already pinned (ID $map_id)"
+            return 0
         fi
-
-        info "Statistics map already pinned (ID $MAP_ID)"
-    else
-        bpftool map pin id "$MAP_ID" "$MAP_PIN"
-        info "Statistics map pinned: $MAP_PIN (ID $MAP_ID)"
+        error "$target map pin refers to a different map!"
+        error "Program map ID: $map_id"
+        error "Pinned map ID : ${existing_id:-UNKNOWN}"
+        exit 1
     fi
-else
-    warn "No map ID found in program information"
-fi
+
+    bpftool map pin id "$map_id" "$map_pin"
+    info "$target map pinned: $map_pin (ID $map_id)"
+}
+
+for map_id in $MAP_IDS; do
+    [[ "$map_id" =~ ^[0-9]+$ ]] || continue
+    pin_map_by_id "$map_id"
+done
 
 # --------------------------------------------------
 # Attach XDP to interfaces
@@ -237,6 +309,11 @@ echo "Program ID       : $PROG_ID"
 echo "Program pin      : $PROG_PIN"
 echo "Object           : $OBJECT"
 echo "Statistics map   : $MAP_PIN"
+echo "Whitelist map    : /sys/fs/bpf/cve_2026_98432_whitelist"
+echo "Whitelist bitmap : /sys/fs/bpf/cve_2026_98432_whitelist_bm"
+echo "Drop IPs map     : /sys/fs/bpf/cve_2026_98432_drop_ips"
+echo "Events map       : /sys/fs/bpf/cve_2026_98432_events"
+echo "Config map       : /sys/fs/bpf/cve_2026_98432_config"
 echo "New attachments  : $ATTACHED"
 echo "Already attached : $ALREADY"
 echo "Other XDP        : $SKIPPED"
