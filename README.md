@@ -542,3 +542,5 @@ Support can be done by ETH, BTC or TRC20 on
 ```
 
 Thank you for supporting independent open-source development!
+
+[![Mitigation status](screenshots/001.jpg)](screenshots/001.jpg)
