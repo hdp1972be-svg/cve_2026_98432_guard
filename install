@@ -2,17 +2,17 @@
 #
 # install
 #
-# Deploy and attach the CVE-2026-98432 XDP guard.
+# deploy and attach the cve-2026-98432 xdp guard.
 #
-# Deployment directory:
+# deployment directory:
 #   /etc/cve-2026-98432-guard
 #
-# Usage:
+# usage:
 #   sudo ./install [object-file]
 #
-# Existing unrelated XDP programs are never overwritten.
+# existing unrelated xdp programs are never overwritten.
 
-set -Eeuo pipefail
+set -uo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPT_PATH="$(readlink -f -- "${BASH_SOURCE[0]}")"
@@ -35,270 +35,306 @@ warn()  { printf "${YELLOW}[!]${RESET} %s\n" "$*"; }
 error() { printf "${RED}[-]${RESET} %s\n" "$*" >&2; }
 
 if [[ $EUID -ne 0 ]]; then
-    error "Run as root: sudo $0"
+    error "run as root: sudo $0"
     exit 1
 fi
 
 for cmd in ip bpftool mountpoint awk grep readlink cmp; do
     if ! command -v "$cmd" >/dev/null 2>&1; then
-        error "Missing dependency: $cmd"
+        error "missing dependency: $cmd"
         exit 1
     fi
 done
 
 if [[ ! -f "$OBJECT_SOURCE" ]]; then
-    error "Object file not found: $OBJECT_SOURCE"
+    error "object file not found: $OBJECT_SOURCE"
     exit 1
 fi
 
 # --------------------------------------------------
-# Deploy files to /etc
+# deploy files to /etc
 # --------------------------------------------------
 
-info "Deploying guard to $ETC_DIR"
+info "deploying guard to $ETC_DIR"
 
 mkdir -p "$ETC_DIR"
 
 deploy_file() {
-    local source="$1"
-    local destination="$2"
-    local mode="$3"
-
+    local source="$1" destination="$2" mode="$3"
     [[ -f "$source" ]] || return 0
-
-    # Avoid copying a file onto itself.
-    if [[ -e "$destination" && "$source" -ef "$destination" ]]; then
-        return 0
-    fi
-
-    if [[ -e "$destination" ]] && cmp -s "$source" "$destination"; then
-        return 0
-    fi
-
-    /usr/bin/install -m "$mode" "$source" "$destination"
-    info "Deployed: $destination"
+    if [[ -e "$destination" && "$source" -ef "$destination" ]]; then return 0; fi
+    if [[ -e "$destination" ]] && cmp -s "$source" "$destination"; then return 0; fi
+    /usr/bin/install -m "$mode" "$source" "$destination" || return 1
+    info "deployed: $destination"
 }
 
-deploy_file "$OBJECT_SOURCE" "$OBJECT" 0644
-deploy_file "$SCRIPT_PATH" "$ETC_DIR/install" 0755
+deploy_file "$OBJECT_SOURCE" "$OBJECT" 0644 || { error "deploy failed"; exit 1; }
+deploy_file "$SCRIPT_PATH" "$ETC_DIR/install" 0755 || true
 
-if [[ -f "$SCRIPT_DIR/checkinstall.sh" ]]; then
-    deploy_file "$SCRIPT_DIR/checkinstall.sh" \
-        "$ETC_DIR/checkinstall.sh" 0755
-fi
-
-if [[ -f "$SCRIPT_DIR/README.md" ]]; then
-    deploy_file "$SCRIPT_DIR/README.md" \
-        "$ETC_DIR/README.md" 0644
-fi
-
-if [[ -f "$SCRIPT_DIR/mtcp-guardd" ]]; then
-    deploy_file "$SCRIPT_DIR/mtcp-guardd" \
-        "$ETC_DIR/mtcp-guardd" 0755
-fi
-
-if [[ -f "$SCRIPT_DIR/mtcp-guard-ctl" ]]; then
-    deploy_file "$SCRIPT_DIR/mtcp-guard-ctl" \
-        "$ETC_DIR/mtcp-guard-ctl" 0755
-fi
-
-if [[ -f "$SCRIPT_DIR/whitelist.conf" ]]; then
-    deploy_file "$SCRIPT_DIR/whitelist.conf" \
-        "$ETC_DIR/whitelist.conf" 0644
-fi
+for extra in checkinstall.sh readme.md mtcp-guardd mtcp-guard-ctl whitelist.conf; do
+    if [[ -f "$SCRIPT_DIR/$extra" ]]; then
+        mode=0644
+        case "$extra" in
+            *.sh|mtcp-guardd|mtcp-guard-ctl) mode=0755 ;;
+        esac
+        deploy_file "$SCRIPT_DIR/$extra" "$ETC_DIR/$extra" "$mode" || true
+    fi
+done
 
 # --------------------------------------------------
-# BPF filesystem
+# bpf filesystem
 # --------------------------------------------------
 
 mkdir -p /sys/fs/bpf
-
 if ! mountpoint -q /sys/fs/bpf; then
-    info "Mounting BPF filesystem"
-    mount -t bpf bpf /sys/fs/bpf
+    info "mounting bpf filesystem"
+    mount -t bpf bpf /sys/fs/bpf || { error "mount bpffs failed"; exit 1; }
 fi
 
 # --------------------------------------------------
-# Load or reuse pinned program
+# load or reuse pinned program
 # --------------------------------------------------
 
 if [[ -e "$PROG_PIN" ]]; then
-    info "Reusing pinned program: $PROG_PIN"
+    info "reusing pinned program: $PROG_PIN"
 else
-    info "Loading XDP program from $OBJECT"
-    bpftool prog load "$OBJECT" "$PROG_PIN" type xdp
+    info "loading xdp program from $OBJECT"
+    if ! bpftool prog load "$OBJECT" "$PROG_PIN" type xdp; then
+        error "bpftool prog load failed"
+        exit 1
+    fi
 fi
 
-PROG_INFO="$(bpftool prog show pinned "$PROG_PIN")"
-PROG_ID="${PROG_INFO%%:*}"
+PROG_NAME_FULL="xdp_cve_2026_98432_guard"
+PROG_NAME_TRUNC="${PROG_NAME_FULL:0:15}"
+
+PROG_ID=""
+PROG_SHOW_ALL="$(bpftool prog show 2>/dev/null || true)"
+
+if [[ -n "$PROG_SHOW_ALL" ]]; then
+    PROG_ID="$(printf '%s\n' "$PROG_SHOW_ALL" \
+        | awk -v n="$PROG_NAME_TRUNC" \
+              '$0 ~ "^[0-9]+: " && $0 ~ ("name " n) {
+                  sub(":", "", $1); print $1; exit }')"
+fi
+
+if [[ ! "$PROG_ID" =~ ^[0-9]+$ ]] && [[ -n "$PROG_SHOW_ALL" ]]; then
+    while read -r cand_id; do
+        [[ "$cand_id" =~ ^[0-9]+$ ]] || continue
+        detail="$(bpftool prog show id "$cand_id" 2>/dev/null || true)"
+        if printf '%s' "$detail" | grep -Fq "pinned $PROG_PIN"; then
+            PROG_ID="$cand_id"
+            break
+        fi
+    done < <(printf '%s\n' "$PROG_SHOW_ALL" | awk -F: '/^[0-9]+:/ {print $1}')
+fi
 
 if [[ ! "$PROG_ID" =~ ^[0-9]+$ ]]; then
-    error "Could not determine program ID"
+    error "could not determine program id"
+    error "--- bpftool prog show (for diagnosis) ---"
+    bpftool prog show 2>&1 | sed 's/^/    /' >&2 || true
+    error "--- end ---"
     exit 1
 fi
 
-info "Program ID: $PROG_ID"
+info "program id: $PROG_ID"
 
 # --------------------------------------------------
-# Statistics and auxiliary maps
+# pin auxiliary maps
+#
+# Shape-based assignment: each map is identified by its
+# (type, key_size, value_size, max_entries) tuple, read from
+# `bpftool map show id N` text output. This works on every
+# bpftool version because the text form has been stable for
+# years, unlike the JSON form whose schema varies.
 # --------------------------------------------------
 
-# Map identification by characteristics:
-#   stats   : PERCPU_ARRAY  key=4 value=8  max_entries=2
-#   whitelist: HASH         key=4 value=1  max_entries=512
-#   whitelist_bm: ARRAY     key=4 value=4  max_entries=256
-#   drop_ips : LRU_HASH     key=4 value=8  max_entries=4096
-#   events   : PERF_EVENT_ARRAY key=4 value=4 max_entries=1024
-#   config   : ARRAY        key=4 value=4  max_entries=1
+declare -A EXPECT=(
+    [stats]="percpu_array 4 8 3"
+    [whitelist]="hash 4 1 4096"
+    [whitelist_bm]="hash 4 1 4096"
+    [drop_ips]="lru_hash 4 8 4096"
+    [events]="perf_event_array 4 4 1024"
+    [config]="array 4 4 1"
+)
 
-MAP_NAMES="stats whitelist whitelist_bm drop_ips events config"
-MAP_PATHS=""
-for mname in $MAP_NAMES; do
-    MAP_PATHS="$MAP_PATHS /sys/fs/bpf/cve_2026_98432_$mname"
-done
+PROG_DETAIL="$(bpftool prog show id "$PROG_ID" 2>/dev/null || true)"
+if [[ -z "$PROG_DETAIL" ]]; then
+    error "bpftool prog show id $PROG_ID returned nothing"
+    exit 1
+fi
 
-# Extract all map IDs from program info
-MAP_IDS="$(
-    awk '
+MAP_IDS=""
+MAP_IDS="$(printf '%s\n' "$PROG_DETAIL" \
+    | awk '
         /map_ids/ {
-            for (i=1; i<=NF; i++)
+            for (i = 1; i <= NF; i++) {
                 if ($i == "map_ids") {
-                    for (j=i+1; j<=NF; j++)
-                        print $j
+                    for (j = i + 1; j <= NF; j++) print $j
                     exit
                 }
-        }
-    ' <<< "$PROG_INFO"
-)"
+            }
+        }' \
+    | tr ',' ' ' || true)"
 
-# Pin each map by matching characteristics
-pin_map_by_id() {
-    local map_id="$1"
-    local map_info
-    local map_type key_size value_size max_entries
-    local target=""
+if [[ -z "$MAP_IDS" ]]; then
+    error "could not extract map_ids from program $PROG_ID"
+    printf '%s\n' "$PROG_DETAIL" | sed 's/^/    /' >&2
+    exit 1
+fi
 
-    map_info="$(bpftool map show id "$map_id" 2>/dev/null || true)"
-    [[ -z "$map_info" ]] && return 1
+# Read shape from text output. Example text:
+#   80: percpu_array  name cve_2026_98432_  flags 0x0
+#           key 4B  value 8B  max_entries 3  memlock 4096B
+# Produces: "percpu_array 4 8 3"
+map_shape() {
+    local id="$1" raw type_word key_v value_v max_v
+    raw="$(bpftool map show id "$id" 2>/dev/null || true)"
+    [[ -n "$raw" ]] || return 1
 
-    map_type="$(awk '/type/ {print $2}' <<< "$map_info")"
-    key_size="$(awk '/key/ {print $2}' <<< "$map_info")"
-    value_size="$(awk '/value/ {print $2}' <<< "$map_info")"
-    max_entries="$(awk '/max_entries/ {print $2}' <<< "$map_info")"
+    # First line: "80: percpu_array  name ..."
+    type_word="$(printf '%s\n' "$raw" \
+        | awk 'NR==1 { for (i=2; i<=NF; i++) { if ($i=="name") break; if ($i ~ /^[a-z_]+$/) { print $i; exit } } }')"
 
-    case "$map_type" in
-        percpu_array)
-            [[ "$key_size" == "4" && "$value_size" == "8" && "$max_entries" == "2" ]] && target="stats"
-            ;;
-        hash)
-            [[ "$key_size" == "4" && "$value_size" == "1" && "$max_entries" == "512" ]] && target="whitelist"
-            [[ "$key_size" == "4" && "$value_size" == "8" && "$max_entries" == "4096" ]] && target="drop_ips"
-            ;;
-        array)
-            [[ "$key_size" == "4" && "$value_size" == "4" && "$max_entries" == "256" ]] && target="whitelist_bm"
-            [[ "$key_size" == "4" && "$value_size" == "4" && "$max_entries" == "1" ]] && target="config"
-            ;;
-        perf_event_array)
-            [[ "$key_size" == "4" && "$value_size" == "4" && "$max_entries" == "1024" ]] && target="events"
-            ;;
-    esac
+    # Second-ish line: "key 4B  value 8B  max_entries 3  memlock 4096B"
+    key_v="$(printf '%s\n' "$raw" \
+        | grep -oE 'key [0-9]+B' | head -1 | grep -oE '[0-9]+')"
+    value_v="$(printf '%s\n' "$raw" \
+        | grep -oE 'value [0-9]+B' | head -1 | grep -oE '[0-9]+')"
+    max_v="$(printf '%s\n' "$raw" \
+        | grep -oE 'max_entries [0-9]+' | head -1 | grep -oE '[0-9]+')"
 
-    [[ -z "$target" ]] && {
-        warn "Unknown map (ID $map_id): type=$map_type key=$key_size value=$value_size max_entries=$max_entries"
-        return 0
+    [[ -n "$type_word" && -n "$key_v" && -n "$value_v" && -n "$max_v" ]] || {
+        # Fallback: dump what we could not parse, for diagnostics.
+        warn "could not parse shape for map id $id"
+        printf '%s\n' "$raw" | sed 's/^/    /' >&2
+        return 1
     }
-
-    local map_pin="/sys/fs/bpf/cve_2026_98432_$target"
-
-    if [[ -e "$map_pin" ]]; then
-        local existing
-        existing="$(bpftool map show pinned "$map_pin" 2>/dev/null || true)"
-        local existing_id="${existing%%:*}"
-        if [[ "$existing_id" == "$map_id" ]]; then
-            info "$target map already pinned (ID $map_id)"
-            return 0
-        fi
-        error "$target map pin refers to a different map!"
-        error "Program map ID: $map_id"
-        error "Pinned map ID : ${existing_id:-UNKNOWN}"
-        exit 1
-    fi
-
-    bpftool map pin id "$map_id" "$map_pin"
-    info "$target map pinned: $map_pin (ID $map_id)"
+    printf '%s %s %s %s\n' "$type_word" "$key_v" "$value_v" "$max_v"
 }
 
-for map_id in $MAP_IDS; do
-    [[ "$map_id" =~ ^[0-9]+$ ]] || continue
-    pin_map_by_id "$map_id"
+declare -A by_shape=()
+for id in $MAP_IDS; do
+    [[ "$id" =~ ^[0-9]+$ ]] || continue
+    shape="$(map_shape "$id")" || continue
+    by_shape[$shape]+="$id "
+done
+
+declare -A assigned=()
+for name in stats drop_ips events config; do
+    want="${EXPECT[$name]}"
+    read -r -a arr <<< "${by_shape[$want]:-}"
+    if (( ${#arr[@]} == 1 )); then
+        assigned[$name]="${arr[0]}"
+    elif (( ${#arr[@]} == 0 )); then
+        error "no map matches shape for '$name' ($want)"
+        error "shapes seen: ${!by_shape[*]}"
+        exit 1
+    else
+        error "multiple maps match shape for '$name': ${arr[*]}"
+        exit 1
+    fi
+done
+
+want_hash="${EXPECT[whitelist]}"
+read -r -a hash_ids <<< "${by_shape[$want_hash]:-}"
+if (( ${#hash_ids[@]} == 2 )); then
+    mapfile -t hash_ids < <(printf '%s\n' "${hash_ids[@]}" | sort -n)
+    assigned[whitelist]="${hash_ids[0]}"
+    assigned[whitelist_bm]="${hash_ids[1]}"
+elif (( ${#hash_ids[@]} == 1 )); then
+    assigned[whitelist]="${hash_ids[0]}"
+else
+    error "expected two hash-shaped maps, found ${#hash_ids[@]}: ${hash_ids[*]:-none}"
+    exit 1
+fi
+
+MAP_SHOW="$(bpftool map show 2>/dev/null || true)"
+map_pin_id() {
+    local pin="$1"
+    [[ -n "$MAP_SHOW" ]] || { echo ""; return; }
+    awk -v pin="$pin" '
+        /^[0-9]+:/ { current_id = $1; sub(":", "", current_id) }
+        $0 ~ ("pinned " pin "$") { print current_id; exit }
+    ' <<< "$MAP_SHOW"
+}
+
+for name in stats whitelist whitelist_bm drop_ips events config; do
+    id="${assigned[$name]:-}"
+    [[ -n "$id" ]] || { error "no id assigned for $name"; exit 1; }
+    pin="/sys/fs/bpf/cve_2026_98432_$name"
+    existing_id="$(map_pin_id "$pin")"
+    if [[ -n "$existing_id" ]]; then
+        if [[ "$existing_id" == "$id" ]]; then
+            info "$name map already pinned (id $id)"
+            continue
+        fi
+        error "$name pin exists but refers to a different map"
+        error "  pinned id : $existing_id"
+        error "  wanted id : $id"
+        exit 1
+    fi
+    shape="$(map_shape "$id" 2>/dev/null || true)"
+    if [[ "$shape" != "${EXPECT[$name]}" ]]; then
+        error "map $id shape mismatch for $name"
+        error "  expected: ${EXPECT[$name]}"
+        error "  actual:   ${shape:-<unreadable>}"
+        exit 1
+    fi
+    if bpftool map pin id "$id" "$pin"; then
+        info "$name map pinned: $pin (id $id)"
+    else
+        error "failed to pin $name map (id $id) to $pin"
+        exit 1
+    fi
 done
 
 # --------------------------------------------------
-# Attach XDP to interfaces
+# attach xdp to interfaces
 # --------------------------------------------------
 
 echo
-info "Scanning network interfaces"
+info "scanning network interfaces"
 echo
 
-ATTACHED=0
-ALREADY=0
-SKIPPED=0
-FAILED=0
+attached=0; already=0; skipped=0; failed=0
 
 for path in /sys/class/net/*; do
     [[ -e "$path" ]] || continue
-
-    IFACE="${path##*/}"
-
-    [[ "$IFACE" == "lo" ]] && continue
-
-    CURRENT="$(bpftool net show dev "$IFACE" 2>/dev/null || true)"
-
-    IDS="$(
-        grep -Eo '(generic|xdpdrv|xdpoffload) id [0-9]+' \
-            <<< "$CURRENT" || true
-    )"
-
-    if [[ -n "$IDS" ]]; then
-        FOUND_EXPECTED=0
-
-        while IFS= read -r ATTACHMENT; do
-            [[ -n "$ATTACHMENT" ]] || continue
-
-            CURRENT_ID="${ATTACHMENT##*id }"
-
-            if [[ "$CURRENT_ID" == "$PROG_ID" ]]; then
-                info "$IFACE: already attached ($ATTACHMENT)"
-                FOUND_EXPECTED=1
+    iface="${path##*/}"
+    [[ "$iface" == "lo" ]] && continue
+    current="$(bpftool net show dev "$iface" 2>/dev/null || true)"
+    ids="$(grep -Eo '(generic|xdpdrv|xdpoffload) id [0-9]+' <<< "$current" || true)"
+    if [[ -n "$ids" ]]; then
+        found_expected=0
+        while IFS= read -r attachment; do
+            [[ -n "$attachment" ]] || continue
+            current_id="${attachment##*id }"
+            if [[ "$current_id" == "$PROG_ID" ]]; then
+                info "$iface: already attached ($attachment)"
+                found_expected=1
             else
-                warn "$IFACE: another XDP program attached ($ATTACHMENT)"
+                warn "$iface: another xdp program attached ($attachment)"
             fi
-        done <<< "$IDS"
-
-        if (( FOUND_EXPECTED )); then
-            ((ALREADY+=1))
-        else
-            warn "$IFACE: existing XDP attachment, not overwritten"
-            ((SKIPPED+=1))
+        done <<< "$ids"
+        if (( found_expected )); then ((already+=1)); else
+            warn "$iface: existing xdp attachment, not overwritten"
+            ((skipped+=1))
         fi
-
         continue
     fi
-
-    info "$IFACE: attaching generic XDP"
-
-    if ip link set dev "$IFACE" xdpgeneric pinned "$PROG_PIN"; then
-        info "$IFACE: attached successfully"
-        ((ATTACHED+=1))
+    info "$iface: attaching generic xdp"
+    if ip link set dev "$iface" xdpgeneric pinned "$PROG_PIN"; then
+        info "$iface: attached successfully"
+        ((attached+=1))
     else
-        error "$IFACE: attachment failed"
-        ((FAILED+=1))
+        error "$iface: attachment failed"
+        ((failed+=1))
     fi
 done
 
 # --------------------------------------------------
-# Summary
+# summary
 # --------------------------------------------------
 
 echo
@@ -308,25 +344,25 @@ echo "=============================================="
 echo "Program ID       : $PROG_ID"
 echo "Program pin      : $PROG_PIN"
 echo "Object           : $OBJECT"
-echo "Statistics map   : $MAP_PIN"
+echo "Statistics map   : /sys/fs/bpf/cve_2026_98432_stats"
 echo "Whitelist map    : /sys/fs/bpf/cve_2026_98432_whitelist"
 echo "Whitelist bitmap : /sys/fs/bpf/cve_2026_98432_whitelist_bm"
 echo "Drop IPs map     : /sys/fs/bpf/cve_2026_98432_drop_ips"
 echo "Events map       : /sys/fs/bpf/cve_2026_98432_events"
 echo "Config map       : /sys/fs/bpf/cve_2026_98432_config"
-echo "New attachments  : $ATTACHED"
-echo "Already attached : $ALREADY"
-echo "Other XDP        : $SKIPPED"
-echo "Failed           : $FAILED"
+echo "New attachments  : $attached"
+echo "Already attached : $already"
+echo "Other XDP        : $skipped"
+echo "Failed           : $failed"
 echo "=============================================="
 
 echo
-info "Current XDP attachments:"
-bpftool net show
+info "current xdp attachments:"
+bpftool net show || true
 
-if (( FAILED > 0 )); then
-    error "Some interfaces could not be attached"
+if (( failed > 0 )); then
+    error "some interfaces could not be attached"
     exit 1
 fi
 
-info "Deployment and attachment complete."
+info "deployment and attachment complete."

@@ -1,0 +1,13 @@
+[Unit]
+Description=BPF filesystem
+Documentation=man:mount(8)
+DefaultDependencies=no
+Before=local-fs.target
+After=systemd-remount-fs.service
+ConditionPathExists=/sys/fs
+
+[Mount]
+What=bpffs
+Where=/sys/fs/bpf
+Type=bpf
+Options=rw,nosuid,nodev,noexec,relatime,mode=700

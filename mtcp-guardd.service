@@ -1,17 +1,36 @@
 [Unit]
-Description=mtcp-guard daemon (perf event consumer, syslog)
+Description=CVE-2026-98432 IPv4 TCP Options XDP Guard (event daemon)
 Documentation=file:/etc/cve-2026-98432-guard/README.md
-Wants=mtcp-guard.service
-After=mtcp-guard.service network.target
+Wants=sys-fs-bpf.mount
+After=sys-fs-bpf.mount
+# Daemon depends on the events map being pinned; don't start otherwise
+ConditionPathExists=/sys/fs/bpf/cve_2026_98432_events
 
 [Service]
 Type=simple
-ExecStartPre=/etc/cve-2026_98432-guard/mtcp-guard-ctl whitelist load /etc/cve-2026_98432_guard/whitelist.conf || true
-ExecStart=/etc/cve-2026_98432-guard/mtcp-guardd
+ExecStart=/etc/cve-2026-98432-guard/mtcp-guardd
 ExecReload=/bin/kill -HUP $MAINPID
-PIDFile=/run/mtcp-guardd.pid
 Restart=on-failure
-RestartSec=5
+RestartSec=2s
+
+# Daemon logs every drop to journald; keep rate-limit control per-unit
+LogRateLimitIntervalSec=30
+LogRateLimitBurst=5000
+
+# Runtime dir for /run/mtcp-guardd.pid
+RuntimeDirectory=mtcp-guardd
+RuntimeDirectoryMode=0755
+
+StandardOutput=journal
+StandardError=journal
+
+# Reasonable hardening that doesn't break BPF map access
+NoNewPrivileges=yes
+ProtectSystem=full
+ProtectHome=yes
+PrivateTmp=yes
+# BPF map access needs the daemon to open fds on /sys/fs/bpf; keep it accessible
+ReadWritePaths=/sys/fs/bpf /run
 
 [Install]
 WantedBy=multi-user.target

@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
+# Force a UTF-8 locale so ${#var} and printf %-*s treat box-drawing
+# characters and multibyte values consistently.
+export LC_ALL="${LC_ALL:-C.UTF-8}"
+
 # ---------------------------------------------------------------------------
 # Color support (only when stdout is a terminal)
 # ---------------------------------------------------------------------------
@@ -9,12 +13,14 @@ if [[ -t 1 ]]; then
     C_GREEN='\033[0;32m'
     C_YELLOW='\033[0;33m'
     C_BLUE='\033[0;34m'
+    C_BOLD='\033[1m'
     C_RESET='\033[0m'
 else
     C_RED=''
     C_GREEN=''
     C_YELLOW=''
     C_BLUE=''
+    C_BOLD=''
     C_RESET=''
 fi
 
@@ -31,22 +37,320 @@ CLANG="${CLANG:-clang}"
 CC="${CC:-gcc}"
 
 # ---------------------------------------------------------------------------
-# Kernel-version aware BPF helper ID selection.
-# bpf_perf_event_output helper ID varies across kernel versions:
-#   kernel < 5.0 : 26 (pre-5.0 enum layout)
-#   kernel >= 5.0: 25 (current stable UAPI layout)
-# Override with BPF_FUNC_PERF_EVENT_OUTPUT env var if needed.
+# Usage / help
 # ---------------------------------------------------------------------------
-KERNEL_MAJOR="$(uname -r | cut -d. -f1)"
-if [[ -n "${BPF_FUNC_PERF_EVENT_OUTPUT:-}" ]]; then
+usage() {
+    cat <<'EOF'
+NAME
+    build.sh - build the CVE-2026-98432 XDP mitigation
+
+SYNOPSIS
+    ./build.sh [OPTIONS]
+
+DESCRIPTION
+    Compiles the eBPF XDP guard and (when libbpf is available) the
+    userspace daemon and control utility.
+
+    By default the script auto-detects the running kernel version and
+    picks the correct map ABI and bpf_perf_event_output helper ID for
+    it. All of that can be overridden with the options below, which is
+    useful when cross-building for a different target kernel.
+
+OPTIONS
+    --kernel X.Y
+        Target kernel version, e.g. 4.18, 5.10, 6.6.
+        Default: auto-detect from the running kernel via uname -r.
+        Affects both map ABI and perf helper ID selection.
+
+    --legacy-maps
+        Force legacy struct bpf_map_def map ABI (required on kernels
+        older than 5.3, and on toolchains that cannot emit BTF).
+        Default: auto (legacy for < 5.3, BTF-style for >= 5.3).
+
+    --btf-maps
+        Force BTF-style map definitions (kernels >= 5.3 with modern
+        libbpf/clang).
+
+    --perf-helper-id N
+        Override the bpf_perf_event_output helper ID.
+        Default: auto (26 for kernels < 5.0, 25 for >= 5.0).
+
+    --no-userspace
+        Skip building mtcp-guardd and mtcp-guard-ctl even if libbpf
+        is installed. Useful for eBPF-only CI builds.
+
+    -h, --help
+        Show this help text and exit.
+
+ENVIRONMENT
+    CLANG                          Clang binary (default: clang)
+    CC                             GCC binary   (default: gcc)
+    BPF_FUNC_PERF_EVENT_OUTPUT     Same as --perf-helper-id
+    LC_ALL                         Forced to C.UTF-8 unless already set
+
+    CLI flags take precedence over environment variables, which in turn
+    take precedence over auto-detection.
+
+EXIT CODES
+    0   Success (or --help)
+    1   Build or capability-check failure
+    2   Invalid command-line argument or unparsable kernel version
+
+EXAMPLES
+    ./build.sh
+        Auto-detect the running kernel and build everything.
+
+    ./build.sh --kernel 5.10
+        Cross-build for kernel 5.10 (BTF maps, perf helper 25).
+
+    ./build.sh --kernel 4.19 --legacy-maps
+        Cross-build for 4.19, forcing the legacy map ABI.
+
+    ./build.sh --btf-maps --perf-helper-id 25
+        Force BTF maps and helper ID 25 on top of auto-detected kernel.
+
+    ./build.sh --no-userspace
+        Build only the eBPF object and packet probe.
+
+    ./build.sh --help
+        Show this help.
+EOF
+}
+
+# ---------------------------------------------------------------------------
+# CLI parsing
+# ---------------------------------------------------------------------------
+KERNEL_ARG=""
+MAPS_MODE="auto"           # auto | legacy | btf
+PERF_HELPER_ARG=""
+BUILD_USERSPACE=1
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --kernel)
+            [[ $# -ge 2 ]] || { err "--kernel requires a value"; exit 2; }
+            KERNEL_ARG="$2"
+            shift 2
+            ;;
+        --kernel=*)
+            KERNEL_ARG="${1#*=}"
+            shift
+            ;;
+        --legacy-maps)
+            MAPS_MODE="legacy"
+            shift
+            ;;
+        --btf-maps)
+            MAPS_MODE="btf"
+            shift
+            ;;
+        --perf-helper-id)
+            [[ $# -ge 2 ]] || { err "--perf-helper-id requires a value"; exit 2; }
+            PERF_HELPER_ARG="$2"
+            shift 2
+            ;;
+        --perf-helper-id=*)
+            PERF_HELPER_ARG="${1#*=}"
+            shift
+            ;;
+        --no-userspace)
+            BUILD_USERSPACE=0
+            shift
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            err "Unknown argument: $1"
+            echo
+            usage >&2
+            exit 2
+            ;;
+    esac
+done
+
+# ---------------------------------------------------------------------------
+# Kernel version detection
+# ---------------------------------------------------------------------------
+# version_at_least MAJOR MINOR THRESH_MAJOR THRESH_MINOR
+version_at_least() {
+    local mj="$1" mn="$2" tmj="$3" tmn="$4"
+    if (( mj > tmj )); then return 0; fi
+    if (( mj < tmj )); then return 1; fi
+    (( mn >= tmn ))
+}
+
+echo "=== cve_2026_98432 XDP build ==="
+info "Source directory: $SCRIPT_DIR"
+echo
+
+if [[ -n "$KERNEL_ARG" ]]; then
+    # ── Explicit target supplied by the user ────────────────────────────
+    TARGET_KERNEL="$KERNEL_ARG"
+    KERNEL_SOURCE="CLI (--kernel)"
+    info "Kernel detection: SKIPPED (explicit --kernel provided)"
+    info "Target kernel:    $TARGET_KERNEL (from $KERNEL_SOURCE)"
+else
+    # ── Auto-detect the running kernel ──────────────────────────────────
+    info "Kernel detection: no --kernel given, auto-detecting running kernel..."
+    echo
+
+    # Step 1: uname -r
+    if command -v uname >/dev/null 2>&1; then
+        DETECTED_REL="$(uname -r 2>/dev/null || true)"
+        if [[ -n "$DETECTED_REL" ]]; then
+            printf '  %b·%b uname -r               -> %s\n' \
+                "$C_BOLD" "$C_RESET" "$DETECTED_REL"
+            DETECTED_VIA="uname -r"
+        else
+            printf '  %b·%b uname -r               -> (empty)\n' \
+                "$C_BOLD" "$C_RESET"
+            DETECTED_REL=""
+        fi
+    else
+        printf '  %b·%b uname                  -> not found\n' \
+            "$C_BOLD" "$C_RESET"
+        DETECTED_REL=""
+    fi
+
+    # Step 2: /proc fallback
+    if [[ -z "$DETECTED_REL" ]] && [[ -r /proc/sys/kernel/osrelease ]]; then
+        DETECTED_REL="$(< /proc/sys/kernel/osrelease)"
+        printf '  %b·%b /proc/sys/kernel/osrelease -> %s\n' \
+            "$C_BOLD" "$C_RESET" "$DETECTED_REL"
+        DETECTED_VIA="/proc/sys/kernel/osrelease"
+    fi
+
+    # Step 3: getconf fallback (rarely needed, harmless)
+    if [[ -z "$DETECTED_REL" ]] && command -v getconf >/dev/null 2>&1; then
+        DETECTED_REL="$(getconf GNU_LINUX_VERSION 2>/dev/null || true)"
+        if [[ -n "$DETECTED_REL" ]]; then
+            printf '  %b·%b getconf GNU_LINUX_VERSION -> %s\n' \
+                "$C_BOLD" "$C_RESET" "$DETECTED_REL"
+            DETECTED_VIA="getconf GNU_LINUX_VERSION"
+        fi
+    fi
+
+    [[ -n "$DETECTED_REL" ]] || {
+        err "Could not auto-detect the running kernel version."
+        err "Pass --kernel X.Y explicitly."
+        exit 2
+    }
+
+    TARGET_KERNEL="$DETECTED_REL"
+    KERNEL_SOURCE="auto-detect ($DETECTED_VIA)"
+    info "Target kernel:    $TARGET_KERNEL (from $KERNEL_SOURCE)"
+fi
+
+# Parse major.minor from whatever string we ended up with
+KERNEL_MM="$(printf '%s\n' "$TARGET_KERNEL" \
+    | sed -nE 's/^([0-9]+)\.([0-9]+).*/\1 \2/p')"
+if [[ -z "$KERNEL_MM" ]]; then
+    err "Could not parse kernel version '$TARGET_KERNEL'."
+    err "Pass --kernel X.Y explicitly if uname -r is unusual."
+    exit 2
+fi
+KERNEL_MAJOR="${KERNEL_MM% *}"
+KERNEL_MINOR="${KERNEL_MM#* }"
+info "Parsed kernel:    major=$KERNEL_MAJOR minor=$KERNEL_MINOR"
+
+# ---------------------------------------------------------------------------
+# Resolve map ABI
+# ---------------------------------------------------------------------------
+case "$MAPS_MODE" in
+    legacy)
+        LEGACY_MAPS=1
+        MAPS_SOURCE="CLI (--legacy-maps)"
+        ;;
+    btf)
+        LEGACY_MAPS=0
+        MAPS_SOURCE="CLI (--btf-maps)"
+        ;;
+    auto)
+        if version_at_least "$KERNEL_MAJOR" "$KERNEL_MINOR" 5 3; then
+            LEGACY_MAPS=0
+            MAPS_SOURCE="auto (kernel >= 5.3)"
+        else
+            LEGACY_MAPS=1
+            MAPS_SOURCE="auto (kernel < 5.3)"
+        fi
+        ;;
+esac
+
+# ---------------------------------------------------------------------------
+# Resolve bpf_perf_event_output helper ID
+# ---------------------------------------------------------------------------
+if [[ -n "$PERF_HELPER_ARG" ]]; then
+    PERF_EVENT_OUTPUT_ID="$PERF_HELPER_ARG"
+    PERF_SOURCE="CLI (--perf-helper-id)"
+elif [[ -n "${BPF_FUNC_PERF_EVENT_OUTPUT:-}" ]]; then
     PERF_EVENT_OUTPUT_ID="${BPF_FUNC_PERF_EVENT_OUTPUT}"
-elif [[ "${KERNEL_MAJOR}" -ge 5 ]]; then
+    PERF_SOURCE="env (BPF_FUNC_PERF_EVENT_OUTPUT)"
+elif version_at_least "$KERNEL_MAJOR" "$KERNEL_MINOR" 5 0; then
     PERF_EVENT_OUTPUT_ID=25
+    PERF_SOURCE="auto (kernel >= 5.0)"
 else
     PERF_EVENT_OUTPUT_ID=26
+    PERF_SOURCE="auto (kernel < 5.0)"
 fi
-info "Detected kernel major: ${KERNEL_MAJOR}; using bpf_perf_event_output helper ID ${PERF_EVENT_OUTPUT_ID}"
 
+[[ "$PERF_EVENT_OUTPUT_ID" =~ ^[0-9]+$ ]] || {
+    err "Invalid perf_event_output helper ID: $PERF_EVENT_OUTPUT_ID"
+    exit 2
+}
+
+# ---------------------------------------------------------------------------
+# Print resolved configuration summary
+#
+# Layout invariants:
+#   - LABEL_W must be >= the longest label INCLUDING the header title.
+#     "Resolved build configuration" is 29 chars, so LABEL_W=30 guarantees
+#     it fits with one space to spare.
+#   - render_row() truncates overlong content so no future value can
+#     silently overrun the field and break the box.
+#   - Every rendered row has exactly LABEL_W + 1 + VALUE_W + 2 characters
+#     between the outer '│' wrappers. The border is generated from that
+#     same INNER_W, so rows and borders always match.
+# ---------------------------------------------------------------------------
+MAP_ABI_STR="legacy (struct bpf_map_def)"
+[[ "$LEGACY_MAPS" -eq 0 ]] && MAP_ABI_STR="BTF-style"
+
+LABEL_W=30      # must be >= len("Resolved build configuration") = 29
+VALUE_W=40
+
+render_row() {
+    local label="$1" value="$2"
+    (( ${#label} > LABEL_W )) && label="${label:0:LABEL_W}"
+    (( ${#value} > VALUE_W )) && value="${value:0:VALUE_W}"
+    printf ' %-*s %-*s ' "$LABEL_W" "$label" "$VALUE_W" "$value"
+}
+
+INNER_W=$(( LABEL_W + VALUE_W + 3 ))
+BORDER="$(awk -v n="$INNER_W" 'BEGIN{ for(i=0;i<n;i++) printf "─"; }')"
+
+TITLE_ROW="$(render_row "Resolved build configuration" "")"
+
+echo "  ┌${BORDER}┐"
+printf '  │%s│\n' "$TITLE_ROW"
+echo "  ├${BORDER}┤"
+
+while IFS='|' read -r label value; do
+    row="$(render_row "$label" "$value")"
+    printf '  │%s│\n' "$row"
+done <<EOF
+Target kernel:|$TARGET_KERNEL
+Kernel source:|$KERNEL_SOURCE
+Map ABI:|$MAP_ABI_STR
+Map ABI source:|$MAPS_SOURCE
+perf_event_output ID:|$PERF_EVENT_OUTPUT_ID
+perf helper source:|$PERF_SOURCE
+EOF
+
+echo "  └${BORDER}┘"
+echo
+
+# ---------------------------------------------------------------------------
 GUARD_SRC="cve_2026_98432_guard.c"
 GUARD_OBJ="cve_2026_98432_guard.o"
 PROBE_SRC="xdp_option_probe.c"
@@ -74,10 +378,6 @@ fail() {
     err "$*"
     exit 1
 }
-
-echo "=== cve_2026_98432 XDP build ==="
-info "Source directory: $SCRIPT_DIR"
-echo
 
 # ---------------------------------------------------------------------------
 # 1. Check kernel capabilities
@@ -110,8 +410,10 @@ ok "Clang found: $("$CLANG" --version | head -n 1)"
 ok "GCC found: $("$CC" --version | head -n 1)"
 info "BPF target support will be tested during compilation."
 
-# Optional libbpf check for userspace tools
-if command -v pkg-config >/dev/null 2>&1 && pkg-config --exists libbpf 2>/dev/null; then
+if [[ "$BUILD_USERSPACE" -eq 0 ]]; then
+    warn "Userspace tools disabled via --no-userspace"
+    HAVE_LIBBPF=0
+elif command -v pkg-config >/dev/null 2>&1 && pkg-config --exists libbpf 2>/dev/null; then
     ok "libbpf found (userspace tools will be built)"
     HAVE_LIBBPF=1
 else
@@ -134,7 +436,6 @@ if [[ "$HAVE_LIBBPF" -eq 1 ]]; then
     [[ -r "$CTL_SRC" ]] || fail "Missing $CTL_SRC"
 fi
 
-# Temporary outputs: don't overwrite existing binaries on failure.
 TMP_GUARD="$(mktemp "$SCRIPT_DIR/.guard.XXXXXX")"
 TMP_PROBE="$(mktemp "$SCRIPT_DIR/.probe.XXXXXX")"
 
@@ -143,11 +444,23 @@ TMP_PROBE="$(mktemp "$SCRIPT_DIR/.probe.XXXXXX")"
 # ---------------------------------------------------------------------------
 echo
 echo "[4/4] Compiling..."
-"$CLANG" -O2 -g -target bpf -Wall -Wextra \
-    -DBPF_FUNC_PERF_EVENT_OUTPUT="${PERF_EVENT_OUTPUT_ID}" \
+
+GUARD_DEFS=(
+    "-DLEGACY_MAPS=${LEGACY_MAPS}"
+    "-DBPF_FUNC_PERF_EVENT_OUTPUT=${PERF_EVENT_OUTPUT_ID}"
+)
+
+if [[ "$LEGACY_MAPS" -eq 1 ]]; then
+    GUARD_DEBUG_FLAGS=()
+else
+    GUARD_DEBUG_FLAGS=(-g)
+fi
+
+"$CLANG" -O2 "${GUARD_DEBUG_FLAGS[@]}" -target bpf -Wall -Wextra \
+    "${GUARD_DEFS[@]}" \
     -c "$GUARD_SRC" \
     -o "$TMP_GUARD"
-ok "eBPF object compiled"
+ok "eBPF object compiled (LEGACY_MAPS=${LEGACY_MAPS})"
 
 "$CC" -O2 -Wall -Wextra \
     -o "$TMP_PROBE" "$PROBE_SRC"
@@ -158,7 +471,7 @@ if [[ "$HAVE_LIBBPF" -eq 1 ]]; then
     TMP_CTL="$(mktemp "$SCRIPT_DIR/.ctl.XXXXXX")"
 
     "$CC" -O2 -Wall -Wextra \
-        -o "$TMP_DAEMON" "$DAEMON_SRC" -lbpf -lelf
+        -o "$TMP_DAEMON" "$DAEMON_SRC" -lbpf -lelf -lsystemd
     ok "Daemon compiled: $DAEMON_BIN"
 
     "$CC" -O2 -Wall -Wextra \
@@ -183,9 +496,9 @@ fi
 
 echo
 ok "BUILD SUCCESSFUL"
-info "eBPF object: $GUARD_OBJ"
-info "Probe binary: $PROBE_BIN"
+info "eBPF object:    $GUARD_OBJ"
+info "Probe binary:   $PROBE_BIN"
 if [[ "$HAVE_LIBBPF" -eq 1 ]]; then
-    info "Daemon binary: $DAEMON_BIN"
+    info "Daemon binary:  $DAEMON_BIN"
     info "Config utility: $CTL_BIN"
 fi

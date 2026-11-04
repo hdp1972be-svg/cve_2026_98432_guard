@@ -1,66 +1,109 @@
-
 /*
- * cve_2026_98432_guard.c
+ * CVE-2026-98432 temporary XDP mitigation
  *
- * Temporary XDP mitigation:
- * Drop IPv4 TCP packets carrying IPv4 options (IHL > 5).
+ * Policy:
+ *   - Drop IPv4/TCP packets with IPv4 options (IHL > 5).
+ *   - Permit explicitly whitelisted source IPv4 addresses.
+ *   - Permit explicitly whitelisted IPv4 /24 prefixes.
+ *   - Pass unrelated traffic and malformed/truncated packets.
+ *   - When the wake flag is set (config map key 0 != 0), the drop is
+ *     bypassed: matching packets are passed instead. Operators can
+ *     toggle enforcement on/off without detaching the XDP program.
  *
- * Pass:
- *   - Non-IPv4 traffic
- *   - Non-TCP IPv4 traffic
- *   - IPv4 TCP packets without IPv4 options
- *   - Malformed or truncated packets
+ * Compatibility:
+ *   - Supports Linux 4.18 through 6.x.
+ *   - Two map-definition paths, selected at build time:
+ *       LEGACY_MAPS=1  -> struct bpf_map_def (4.18 .. 5.17, old toolchains)
+ *       LEGACY_MAPS=0  -> BTF-style maps       (5.3+ / 6.x, modern libbpf)
+ *   - No includes: all types, constants and structs are declared locally.
+ *   - VLAN parsing is expanded explicitly (no bounded loop) so the 4.18
+ *     verifier accepts the program.
  *
- * Supports Ethernet and up to two VLAN tags.
- *
- * Per-CPU statistics:
- *   key 0: IPv4 TCP packets dropped due to IP options
- *   key 1: Malformed/truncated IPv4 packets passed
+ * GPL licensed.
  */
 
 #define SEC(NAME) __attribute__((section(NAME), used))
-#define __uint(name, val) int (*name)[val]
-#define __type(name, val) val *name
 
+#ifndef __always_inline
+#define __always_inline inline __attribute__((always_inline))
+#endif
+
+/* ── Local scalar typedefs ───────────────────────────────────────────── */
 typedef unsigned char      __u8;
 typedef unsigned short     __u16;
 typedef unsigned int       __u32;
 typedef unsigned long long __u64;
+typedef signed int         __s32;
+typedef __u16              __be16;
+typedef __u32              __be32;
 
-#define XDP_DROP 1
-#define XDP_PASS 2
-
-#define ETH_P_IP       0x0800
-#define ETH_P_8021Q    0x8100
-#define ETH_P_8021AD   0x88A8
-#define ETH_P_9100     0x9100
-
-#define IPPROTO_TCP    6
-
-#define STAT_TCP_IP_OPTIONS_DROP  0
-#define STAT_MALFORMED_IPV4_PASS  1
-
-#define WHITELIST_HASH_ENTRIES  512
-#define WHITELIST_BM_ENTRIES    256
-#define DROP_IPS_LRU_ENTRIES    4096
-
-#define BPF_MAP_TYPE_UNSPEC             0
-#define BPF_MAP_TYPE_HASH               1
-#define BPF_MAP_TYPE_ARRAY              2
-#define BPF_MAP_TYPE_PERCPU_ARRAY       6
-#define BPF_MAP_TYPE_LRU_HASH           7
-#define BPF_MAP_TYPE_PERF_EVENT_ARRAY  14
-
-#define BPF_NOEXIST 1
-#define BPF_EXIST   2
-#define BPF_F_CURRENT_CPU 0xffffffffULL
-
-#define BPF_FUNC_map_lookup_elem     1
-#define BPF_FUNC_map_update_elem     2
-#ifndef BPF_FUNC_PERF_EVENT_OUTPUT
-#define BPF_FUNC_PERF_EVENT_OUTPUT 25
+/* ── Local constants ─────────────────────────────────────────────────── */
+#ifndef NULL
+#define NULL ((void *)0)
 #endif
 
+#define ETH_P_8021Q   0x8100
+#define ETH_P_8021AD  0x88A8
+#define ETH_P_IP      0x0800
+
+#define IPPROTO_TCP   6
+
+/* BPF map types */
+#define BPF_MAP_TYPE_HASH             1
+#define BPF_MAP_TYPE_ARRAY            2
+#define BPF_MAP_TYPE_PERCPU_ARRAY     6
+#define BPF_MAP_TYPE_PERF_EVENT_ARRAY 4
+#define BPF_MAP_TYPE_LRU_HASH         9
+
+/* BPF helper IDs */
+#define BPF_FUNC_MAP_LOOKUP_ELEM   1
+#define BPF_FUNC_MAP_UPDATE_ELEM   2
+#define BPF_FUNC_PERF_EVENT_OUTPUT 25
+
+/* BPF update flags / misc */
+#define BPF_ANY           0
+#define BPF_NOEXIST       1
+#define BPF_F_CURRENT_CPU 0xffffffffULL
+
+/* XDP action codes */
+#define XDP_ABORTED 0
+#define XDP_DROP    1
+#define XDP_PASS    2
+#define XDP_TX      3
+#define XDP_REDIRECT 4
+
+/* ── Local packet structs (packed, no headers needed) ────────────────── */
+struct ethhdr {
+    unsigned char  h_dest[6];
+    unsigned char  h_source[6];
+    __be16         h_proto;
+} __attribute__((packed));
+
+struct vlan_hdr {
+    __be16 h_vlan_TCI;
+    __be16 h_vlan_encapsulated_proto;
+} __attribute__((packed));
+
+struct iphdr {
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+    __u8   ihl:4;
+    __u8   version:4;
+#else
+    __u8   version:4;
+    __u8   ihl:4;
+#endif
+    __u8   tos;
+    __be16 tot_len;
+    __be16 id;
+    __be16 frag_off;
+    __u8   ttl;
+    __u8   protocol;
+    __u16  check;
+    __be32 saddr;
+    __be32 daddr;
+} __attribute__((packed));
+
+/* XDP context as exposed to BPF programs. */
 struct xdp_md {
     __u32 data;
     __u32 data_end;
@@ -70,63 +113,116 @@ struct xdp_md {
     __u32 egress_ifindex;
 };
 
-struct ethhdr {
-    __u8  h_dest[6];
-    __u8  h_source[6];
-    __u16 h_proto;
+/* ── Application structs ─────────────────────────────────────────────── */
+struct drop_event {
+    __u32 src_ip;
+    __u64 count;
 };
 
-struct vlan_hdr {
-    __u16 tci;
-    __u16 encapsulated_proto;
+#define STAT_TCP_IP_OPTIONS_DROP  0
+#define STAT_MALFORMED_IPV4_PASS  1
+/* New: packets that would have been dropped but were passed because
+ * the wake flag was set. Distinct from both drop and whitelist-pass,
+ * so operators can see how much "wake mode" is masking enforcement. */
+#define STAT_TCP_IP_OPTIONS_WAKE  2
+
+#define STATS_ENTRIES 3
+
+#define WHITELIST_ENTRIES 4096
+#define PREFIX_ENTRIES    4096
+#define DROP_IPS_ENTRIES  4096
+#define EVENTS_ENTRIES    1024
+
+/*
+ * Map definitions.
+ *
+ * Build with -DLEGACY_MAPS=1 for kernels 4.18 .. 5.17 (or old toolchains
+ * that cannot emit BTF). Build without it (default) for 5.3+ / 6.x.
+ */
+#ifndef LEGACY_MAPS
+#define LEGACY_MAPS 0
+#endif
+
+#if LEGACY_MAPS
+
+/* Legacy map ABI: struct bpf_map_def. */
+struct bpf_map_def {
+    __u32 type;
+    __u32 key_size;
+    __u32 value_size;
+    __u32 max_entries;
+    __u32 map_flags;
 };
 
-struct iphdr {
-    __u8  version_ihl;
-    __u8  tos;
-    __u16 tot_len;
-    __u16 id;
-    __u16 frag_off;
-    __u8  ttl;
-    __u8  protocol;
-    __u16 check;
-    __u32 saddr;
-    __u32 daddr;
+/* Statistics: per-CPU counters (3 slots now). */
+struct bpf_map_def SEC("maps") cve_2026_98432_stats = {
+    BPF_MAP_TYPE_PERCPU_ARRAY, sizeof(__u32), sizeof(__u64), STATS_ENTRIES, 0
 };
+
+/* Exact IPv4 whitelist. */
+struct bpf_map_def SEC("maps") cve_2026_98432_whitelist = {
+    BPF_MAP_TYPE_HASH, sizeof(__u32), sizeof(__u8), WHITELIST_ENTRIES, 0
+};
+
+/* Historical map name retained for pin-path compatibility (/24 keys). */
+struct bpf_map_def SEC("maps") cve_2026_98432_whitelist_bm = {
+    BPF_MAP_TYPE_HASH, sizeof(__u32), sizeof(__u8), PREFIX_ENTRIES, 0
+};
+
+/* Per-source drop counters. */
+struct bpf_map_def SEC("maps") cve_2026_98432_drop_ips = {
+    BPF_MAP_TYPE_LRU_HASH, sizeof(__u32), sizeof(__u64), DROP_IPS_ENTRIES, 0
+};
+
+/* perf_event_output requires PERF_EVENT_ARRAY. */
+struct bpf_map_def SEC("maps") cve_2026_98432_events = {
+    BPF_MAP_TYPE_PERF_EVENT_ARRAY, sizeof(__u32), sizeof(__u32), EVENTS_ENTRIES, 0
+};
+
+/* Runtime configuration (key 0 = wake flag). */
+struct bpf_map_def SEC("maps") cve_2026_98432_config = {
+    BPF_MAP_TYPE_ARRAY, sizeof(__u32), sizeof(__u32), 1, 0
+};
+
+#else /* !LEGACY_MAPS */
+
+/* BTF-style map definitions, macros declared locally. */
+#define __uint(name, val) int (*name)[val]
+#define __type(name, val) typeof(val) *name
 
 struct {
-    __uint(type, 6);       /* BPF_MAP_TYPE_PERCPU_ARRAY */
-    __uint(max_entries, 2);
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(max_entries, STATS_ENTRIES);
     __type(key, __u32);
     __type(value, __u64);
 } cve_2026_98432_stats SEC(".maps");
 
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
-    __uint(max_entries, WHITELIST_HASH_ENTRIES);
+    __uint(max_entries, WHITELIST_ENTRIES);
     __type(key, __u32);
     __type(value, __u8);
 } cve_2026_98432_whitelist SEC(".maps");
 
 struct {
-    __uint(type, BPF_MAP_TYPE_ARRAY);
-    __uint(max_entries, WHITELIST_BM_ENTRIES);
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, PREFIX_ENTRIES);
     __type(key, __u32);
-    __type(value, __u32);
+    __type(value, __u8);
 } cve_2026_98432_whitelist_bm SEC(".maps");
 
 struct {
-    __uint(type, BPF_MAP_TYPE_HASH);
-    __uint(max_entries, DROP_IPS_LRU_ENTRIES);
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, DROP_IPS_ENTRIES);
     __type(key, __u32);
     __type(value, __u64);
 } cve_2026_98432_drop_ips SEC(".maps");
 
 struct {
     __uint(type, BPF_MAP_TYPE_PERF_EVENT_ARRAY);
-    __uint(max_entries, 1024);
-    __type(key, __u32);
-    __type(value, __u32);
+    __uint(key_size, sizeof(__u32));
+    __uint(value_size, sizeof(__u32));
+    __uint(max_entries, EVENTS_ENTRIES);
 } cve_2026_98432_events SEC(".maps");
 
 struct {
@@ -136,182 +232,222 @@ struct {
     __type(value, __u32);
 } cve_2026_98432_config SEC(".maps");
 
-/* BPF helper: bpf_map_lookup_elem, helper ID 1 */
-static void *(*bpf_map_lookup_elem)(void *map, const void *key) =
-    (void *)1;
+#endif /* LEGACY_MAPS */
 
-static long (*bpf_map_update_elem)(void *map, const void *key,
-                                   const void *value, __u64 flags) =
-    (void *)2;
+/* ── Helper prototypes, declared locally ─────────────────────────────── */
+static void *(*bpf_map_lookup_elem)(void *, const void *) =
+    (void *)BPF_FUNC_MAP_LOOKUP_ELEM;
 
-static long (*bpf_perf_event_output)(void *ctx, void *map, __u64 flags,
-                                     void *data, __u64 size) =
-    (void *)BPF_FUNC_PERF_EVENT_OUTPUT;
+static long (*bpf_map_update_elem)(
+    void *, const void *, const void *, __u64
+) = (void *)BPF_FUNC_MAP_UPDATE_ELEM;
 
-static __inline __u16 ntohs(__u16 value)
+static long (*bpf_perf_event_output)(
+    void *, void *, __u64, void *, __u64
+) = (void *)BPF_FUNC_PERF_EVENT_OUTPUT;
+
+/* ── Inline helpers ──────────────────────────────────────────────────── */
+static __always_inline __u16 swap16(__u16 value)
 {
     return __builtin_bswap16(value);
 }
 
-static __inline void count_stat(__u32 key)
+/*
+ * ip->saddr is kept in its native packet representation.
+ * On little-endian systems, masking the low 24 bits produces
+ * the network-order /24 key.
+ */
+static __always_inline __u32 prefix24(__u32 ip)
 {
-    __u64 *counter;
-
-    counter = bpf_map_lookup_elem(&cve_2026_98432_stats, &key);
-
-    if (counter)
-        (*counter)++;
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+    return ip & 0x00ffffffU;
+#else
+    return ip & 0xffffff00U;
+#endif
 }
 
-/* Whitelist lookup: bitmap fast path (/24) -> hash exact match */
-static __inline int is_whitelisted(__u32 src_ip)
+static __always_inline void increment_stat(__u32 index)
 {
-    __u32 *bm;
-    __u32 idx;
-    __u32 bit;
-    __u8 *wl;
+    __u64 *value;
 
-    /* Bitmap fast path: index = /24 prefix, bit = group of 8 within /24 */
-    idx = src_ip >> 8;
-    bm = bpf_map_lookup_elem(&cve_2026_98432_whitelist_bm, &idx);
-    if (bm) {
-        bit = 1 << ((src_ip >> 3) & 0x1f);
-        if (*bm & bit)
-            return 1;
-    }
+    value = bpf_map_lookup_elem(
+        &cve_2026_98432_stats, &index
+    );
 
-    /* Hash fallback: exact IP match */
-    wl = bpf_map_lookup_elem(&cve_2026_98432_whitelist, &src_ip);
-    if (wl)
+    if (value)
+        __sync_fetch_and_add(value, 1);
+}
+
+static __always_inline int is_whitelisted(__u32 ip)
+{
+    __u8 *value;
+    __u32 network;
+
+    value = bpf_map_lookup_elem(
+        &cve_2026_98432_whitelist, &ip
+    );
+
+    if (value)
         return 1;
 
-    return 0;
+    network = prefix24(ip);
+
+    value = bpf_map_lookup_elem(
+        &cve_2026_98432_whitelist_bm, &network
+    );
+
+    return value != 0;
 }
 
+/*
+ * Returns 1 if wake mode is enabled (bypass drop), 0 otherwise.
+ * Also forces the compiler to keep cve_2026_98432_config in the
+ * generated object: without a reference, the map is dropped and
+ * userspace cannot write to it, which is what caused `wake on|off`
+ * to fail with ENOENT earlier.
+ */
+static __always_inline int wake_enabled(void)
+{
+    __u32 key = 0;
+    __u32 *val;
+
+    val = bpf_map_lookup_elem(&cve_2026_98432_config, &key);
+    return val && *val;
+}
+
+/* ── XDP entry point ─────────────────────────────────────────────────── */
 SEC("xdp")
 int xdp_cve_2026_98432_guard(struct xdp_md *ctx)
 {
     void *data = (void *)(long)ctx->data;
     void *data_end = (void *)(long)ctx->data_end;
 
-    struct ethhdr *eth;
-    struct vlan_hdr *vlan;
+    struct ethhdr *eth = data;
     struct iphdr *ip;
 
-    __u16 proto;
-    __u8 version;
-    __u8 ihl;
-    __u32 ip_header_length;
+    __u16 protocol;
+    __u32 ihl_length;
+    __u32 source_ip;
 
-    /* Ethernet header */
-    eth = data;
+    void *cursor;
+
+    struct drop_event event = {};
 
     if ((void *)(eth + 1) > data_end)
         return XDP_PASS;
 
-    proto = ntohs(eth->h_proto);
+    protocol = swap16(eth->h_proto);
+    cursor = eth + 1;
 
-    /* First VLAN tag */
-    if (proto == ETH_P_8021Q ||
-        proto == ETH_P_8021AD ||
-        proto == ETH_P_9100) {
-
-        vlan = (void *)(eth + 1);
+    /*
+     * Support up to two VLAN headers.
+     * Expanded explicitly (no loop) so the 4.18 verifier, which cannot
+     * handle bounded loops, accepts the program.
+     */
+    if (protocol == ETH_P_8021Q ||
+        protocol == ETH_P_8021AD ||
+        protocol == 0x9100) {
+        struct vlan_hdr *vlan = cursor;
 
         if ((void *)(vlan + 1) > data_end)
             return XDP_PASS;
 
-        proto = ntohs(vlan->encapsulated_proto);
+        protocol = swap16(vlan->h_vlan_encapsulated_proto);
+        cursor = vlan + 1;
 
-        /* Second VLAN tag */
-        if (proto == ETH_P_8021Q ||
-            proto == ETH_P_8021AD ||
-            proto == ETH_P_9100) {
-
-            vlan = (void *)(vlan + 1);
+        if (protocol == ETH_P_8021Q ||
+            protocol == ETH_P_8021AD ||
+            protocol == 0x9100) {
+            vlan = cursor;
 
             if ((void *)(vlan + 1) > data_end)
                 return XDP_PASS;
 
-            proto = ntohs(vlan->encapsulated_proto);
+            protocol = swap16(vlan->h_vlan_encapsulated_proto);
+            cursor = vlan + 1;
         }
-
-        ip = (void *)(vlan + 1);
-    } else {
-        ip = (void *)(eth + 1);
     }
 
-    /* Only IPv4 */
-    if (proto != ETH_P_IP)
+    if (protocol != ETH_P_IP)
         return XDP_PASS;
 
-    /* Fixed IPv4 header must be present */
+    ip = cursor;
+
     if ((void *)(ip + 1) > data_end) {
-        count_stat(STAT_MALFORMED_IPV4_PASS);
+        increment_stat(STAT_MALFORMED_IPV4_PASS);
         return XDP_PASS;
     }
 
-    version = ip->version_ihl >> 4;
-    ihl = ip->version_ihl & 0x0f;
-
-    /* Validate IPv4 version and IHL */
-    if (version != 4 || ihl < 5 || ihl > 15) {
-        count_stat(STAT_MALFORMED_IPV4_PASS);
+    if (ip->version != 4 || ip->ihl < 5) {
+        increment_stat(STAT_MALFORMED_IPV4_PASS);
         return XDP_PASS;
     }
 
-    ip_header_length = (__u32)ihl * 4;
+    ihl_length = (__u32)ip->ihl * 4;
 
-    /* Verify complete IPv4 header, including options */
-    if ((void *)ip + ip_header_length > data_end) {
-        count_stat(STAT_MALFORMED_IPV4_PASS);
+    if ((void *)ip + ihl_length > data_end) {
+        increment_stat(STAT_MALFORMED_IPV4_PASS);
+        return XDP_PASS;
+    }
+
+    /* Only TCP packets with IPv4 options are in scope. */
+    if (ip->protocol != IPPROTO_TCP || ihl_length == sizeof(*ip))
+        return XDP_PASS;
+
+    source_ip = ip->saddr;
+
+    if (is_whitelisted(source_ip))
+        return XDP_PASS;
+
+    /*
+     * Wake mode: bypass the drop while still counting it separately,
+     * so operators can see exactly how many packets would have been
+     * dropped had enforcement been active.
+     */
+    if (wake_enabled()) {
+        increment_stat(STAT_TCP_IP_OPTIONS_WAKE);
         return XDP_PASS;
     }
 
     /*
-     * Drop TCP packets with IPv4 options.
-     * TCP options are unaffected; they are in the TCP header.
+     * Update approximate per-source counters.
+     * Atomic increment prevents lost increments when the key exists.
      */
-    if (ip->protocol == IPPROTO_TCP && ihl > 5) {
-        __u32 src_ip;
-        __u64 *cnt;
-        __u64 new_cnt = 1;
+    {
+        __u64 initial = 1;
+        __u64 *counter;
 
-        src_ip = ip->saddr;
+        counter = bpf_map_lookup_elem(
+            &cve_2026_98432_drop_ips, &source_ip
+        );
 
-        if (is_whitelisted(src_ip))
-            return XDP_PASS;
-
-        /* Record drop source IP in hash */
-        cnt = bpf_map_lookup_elem(&cve_2026_98432_drop_ips, &src_ip);
-        if (cnt) {
-            new_cnt = *cnt + 1;
-            bpf_map_update_elem(&cve_2026_98432_drop_ips, &src_ip,
-                                &new_cnt, BPF_EXIST);
+        if (counter) {
+            __sync_fetch_and_add(counter, 1);
+            initial = *counter;
         } else {
-            bpf_map_update_elem(&cve_2026_98432_drop_ips, &src_ip,
-                                &new_cnt, BPF_NOEXIST);
+            bpf_map_update_elem(
+                &cve_2026_98432_drop_ips,
+                &source_ip,
+                &initial,
+                BPF_NOEXIST
+            );
         }
 
-        /* Notify userspace daemon via perf event buffer */
-        {
-            struct drop_event {
-                __u32 src_ip;
-                __u64 count;
-            } event = {};
-
-            event.src_ip = src_ip;
-            event.count = new_cnt;
-            bpf_perf_event_output(ctx, &cve_2026_98432_events,
-                                  BPF_F_CURRENT_CPU, &event,
-                                  sizeof(event));
-        }
-
-        count_stat(STAT_TCP_IP_OPTIONS_DROP);
-        return XDP_DROP;
+        event.src_ip = source_ip;
+        event.count = initial;
     }
 
-    return XDP_PASS;
+    bpf_perf_event_output(
+        ctx,
+        &cve_2026_98432_events,
+        BPF_F_CURRENT_CPU,
+        &event,
+        sizeof(event)
+    );
+
+    increment_stat(STAT_TCP_IP_OPTIONS_DROP);
+
+    return XDP_DROP;
 }
 
 char LICENSE[] SEC("license") = "GPL";

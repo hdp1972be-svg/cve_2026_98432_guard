@@ -8,12 +8,13 @@ Before=network.target
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-
 WorkingDirectory=/etc/cve-2026-98432-guard
 ExecStartPre=/usr/bin/test -r /etc/cve-2026-98432-guard/cve_2026_98432_guard.o
+ExecStartPre=/usr/bin/test -x /etc/cve-2026-98432-guard/install
 ExecStart=/etc/cve-2026-98432-guard/install
-
 TimeoutStartSec=60
+TimeoutStopSec=30
+Restart=no
 
 [Install]
 WantedBy=multi-user.target
