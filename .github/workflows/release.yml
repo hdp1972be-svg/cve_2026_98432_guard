@@ -1,0 +1,186 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:  # Add this line
+
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    # Run directly on an Alpine-based runner (not a container inside Ubuntu)
+    runs-on: ubuntu-latest
+    container:
+      image: alpine:3.20
+      options: --user root
+
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-linux-musl
+            arch: amd64
+          - target: aarch64-linux-musl
+            arch: arm64
+
+    steps:
+      - name: Install build dependencies
+        run: |
+          apk add --no-cache \
+            zig \
+            gcc \
+            musl-dev \
+            libbpf-dev \
+            libelf-dev \
+            zlib-dev \
+            linux-headers \
+            make \
+            git
+
+      - uses: actions/checkout@v4
+
+      - name: Build static binary for ${{ matrix.arch }}
+        run: |
+          mkdir -p dist/${{ matrix.arch }}
+          zig cc -target ${{ matrix.target }} -static -O2 \
+            -o dist/${{ matrix.arch }}/mtcp-guard-ctl \
+            mtcp-guard-ctl.c -lbpf -lelf -lz
+          zig cc -target ${{ matrix.target }} -static -O2 \
+            -o dist/${{ matrix.arch }}/mtcp-guardd \
+            mtcp-guardd.c -lbpf -lelf -lz
+
+      - name: Verify static linkage
+        run: |
+          file dist/${{ matrix.arch }}/mtcp-guard-ctl
+          file dist/${{ matrix.arch }}/mtcp-guardd
+          # ldd should report "not a dynamic executable" or "statically linked"
+          ldd dist/${{ matrix.arch }}/mtcp-guard-ctl 2>&1 || true
+          ldd dist/${{ matrix.arch }}/mtcp-guardd 2>&1 || true
+
+      - name: Upload binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: binaries-${{ matrix.arch }}
+          path: dist/${{ matrix.arch }}/
+
+  build-deb:
+    needs: build
+    runs-on: ubuntu-latest
+    container:
+      image: alpine:3.20
+      options: --user root
+    strategy:
+      matrix:
+        arch: [amd64, arm64]
+
+    steps:
+      - name: Install packaging tools
+        run: |
+          apk add --no-cache dpkg tar gzip
+
+      - uses: actions/checkout@v4
+
+      - name: Download binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: binaries-${{ matrix.arch }}
+          path: dist/${{ matrix.arch }}
+
+      - name: Build .deb
+        run: |
+          PKG="cve-2026-98432-guard_${GITHUB_REF_NAME#v}_${matrix.arch}"
+          mkdir -p "${PKG}/DEBIAN" "${PKG}/usr/bin" \
+                   "${PKG}/etc/cve-2026-98432-guard" \
+                   "${PKG}/lib/systemd/system"
+
+          cp dist/${{ matrix.arch }}/mtcp-guard-ctl "${PKG}/usr/bin/"
+          cp dist/${{ matrix.arch }}/mtcp-guardd    "${PKG}/usr/bin/"
+
+          cp whitelist.conf "${PKG}/etc/cve-2026-98432-guard/" 2>/dev/null || true
+          cp mtcp-guard-load.service mtcp-guardd.service "${PKG}/lib/systemd/system/" 2>/dev/null || true
+
+          cat > "${PKG}/DEBIAN/control" <<EOF
+          Package: cve-2026-98432-guard
+          Version: ${GITHUB_REF_NAME#v}
+          Section: net
+          Priority: optional
+          Architecture: ${matrix.arch}
+          Maintainer: Your Name <you@example.com>
+          Description: XDP guard for CVE-2026-98432
+           Runtime mitigation and detection for IPv4/TCP option handling.
+          EOF
+
+          cat > "${PKG}/DEBIAN/postinst" <<'EOF'
+          #!/bin/sh
+          set -e
+          systemctl daemon-reload || true
+          systemctl enable mtcp-guardd.service || true
+          EOF
+          chmod 755 "${PKG}/DEBIAN/postinst"
+
+          cat > "${PKG}/DEBIAN/prerm" <<'EOF'
+          #!/bin/sh
+          set -e
+          systemctl stop mtcp-guardd.service || true
+          EOF
+          chmod 755 "${PKG}/DEBIAN/prerm"
+
+          dpkg-deb --build "${PKG}"
+
+      - name: Upload .deb
+        uses: actions/upload-artifact@v4
+        with:
+          name: deb-${{ matrix.arch }}
+          path: "*.deb"
+
+  release:
+    needs: [build, build-deb]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Prepare release bundle
+        run: |
+          mkdir -p release/cve-2026-98432-guard-${GITHUB_REF_NAME}
+          cp -r artifacts/binaries-amd64/* release/cve-2026-98432-guard-${GITHUB_REF_NAME}/ 2>/dev/null || true
+          cp -r artifacts/binaries-arm64/* release/cve-2026-98432-guard-${GITHUB_REF_NAME}/ 2>/dev/null || true
+          cp *.c *.h install remove install-service build.sh *.service whitelist.conf README.md 2>/dev/null || true
+          tar czf cve-2026-98432-guard-${GITHUB_REF_NAME}-all.tar.gz \
+              -C release cve-2026-98432-guard-${GITHUB_REF_NAME}
+
+      - name: Create source tarball
+        run: |
+          git archive --format=tar.gz \
+            --prefix=cve-2026-98432-guard-${GITHUB_REF_NAME}/ \
+            -o cve-2026-98432-guard-${GITHUB_REF_NAME}-src.tar.gz HEAD
+
+      - name: Generate checksums
+        run: |
+          sha256sum artifacts/deb-amd64/*.deb \
+                    artifacts/deb-arm64/*.deb \
+                    artifacts/binaries-amd64/* \
+                    artifacts/binaries-arm64/* \
+                    cve-2026-98432-guard-*-all.tar.gz \
+                    cve-2026-98432-guard-*-src.tar.gz \
+                    > SHA256SUMS
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            SHA256SUMS
+            cve-2026-98432-guard-*-all.tar.gz
+            cve-2026-98432-guard-*-src.tar.gz
+            artifacts/deb-amd64/*.deb
+            artifacts/deb-arm64/*.deb
+            artifacts/binaries-amd64/*
+            artifacts/binaries-arm64/*
+          generate_release_notes: true
