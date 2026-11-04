@@ -27,6 +27,11 @@ jobs:
             arch: arm64
 
     steps:
+      - name: Install git for checkout
+        run: apk add --no-cache git
+
+      - uses: actions/checkout@v4
+
       - name: Install build dependencies
         run: |
           apk update
@@ -39,8 +44,7 @@ jobs:
             elfutils-dev \
             zlib-dev \
             linux-headers \
-            make \
-            git
+            make 
 
       - name: Build static binary for ${{ matrix.arch }}
         run: |
