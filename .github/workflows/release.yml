@@ -29,7 +29,9 @@ jobs:
     steps:
       - name: Install build dependencies
         run: |
+          apk update
           apk add --no-cache \
+            ca-certificates \
             zig \
             gcc \
             musl-dev \
@@ -39,8 +41,6 @@ jobs:
             linux-headers \
             make \
             git
-
-      - uses: actions/checkout@v4
 
       - name: Build static binary for ${{ matrix.arch }}
         run: |
