@@ -1,0 +1,112 @@
+#!/usr/bin/env bash
+set -uo pipefail
+
+PCAP="/tmp/drops-veth.pcap"
+DAEMON="./mtcp-guardd"
+PROG_PIN="/sys/fs/bpf/cve_2026_98432_guard"
+PID_FILE="/run/mtcp-guardd.pid"
+
+echo "=== veth test ==="
+
+# --- 1. fresh daemon ---
+sudo systemctl stop mtcp-guardd 2>/dev/null || true
+sudo pkill -TERM -x mtcp-guardd 2>/dev/null || true
+sleep 0.5
+sudo pkill -KILL -x mtcp-guardd 2>/dev/null || true
+sudo rm -f "$PCAP"
+
+# --- 2. ensure veth pair exists ---
+if ! ip link show veth0 >/dev/null 2>&1; then
+    echo "[+] creating veth pair"
+    sudo ip link add veth0 type veth peer name veth1
+fi
+sudo ip link set veth0 up
+sudo ip link set veth1 up
+
+# --- 3. ensure guard attached to both veth ends ---
+for IFACE in veth0 veth1; do
+    if ! sudo bpftool net show dev "$IFACE" 2>/dev/null | grep -q " id "; then
+        echo "[+] attaching guard to $IFACE"
+        if sudo ip link set dev "$IFACE" xdpdrv pinned "$PROG_PIN" 2>/dev/null; then
+            echo "    xdpdrv"
+        elif sudo ip link set dev "$IFACE" xdpgeneric pinned "$PROG_PIN" 2>/dev/null; then
+            echo "    xdpgeneric"
+        else
+            echo "[!] attach failed on $IFACE"
+            exit 1
+        fi
+    fi
+done
+sudo bpftool net show dev veth0
+sudo bpftool net show dev veth1
+
+# --- 4. start daemon ---
+sudo "$DAEMON" -d -p "$PCAP"
+sleep 1
+NEW_PID="$(sudo cat "$PID_FILE" 2>/dev/null || true)"
+echo "[+] daemon pid: $NEW_PID"
+
+# --- 5. wake off, whitelist clear ---
+sudo ./mtcp-guard-ctl wake off
+sudo ./mtcp-guard-ctl whitelist remove 192.0.2.99 2>/dev/null || true
+
+# --- 6. probe on veth1 (arrives on veth0 ingress) ---
+VETH1_MAC="$(cat /sys/class/net/veth1/address)"
+VETH0_MAC="$(cat /sys/class/net/veth0/address)"
+echo "[+] sending probe via veth1 (dst=$VETH0_MAC)"
+sudo ./xdp_option_probe veth1 "$VETH0_MAC" 192.0.2.99 10.99.99.1 8080
+sleep 1
+
+echo
+echo "--- stats after veth drop ---"
+sudo ./mtcp-guard-ctl stats
+echo
+echo "--- drop-ips ---"
+sudo ./mtcp-guard-ctl drop-ips
+echo
+echo "--- pcap ---"
+ls -la "$PCAP"
+echo
+echo "--- pcap contents ---"
+sudo tcpdump -r "$PCAP" -nn -XX -c 3
+
+# --- 7. wake on, probe again ---
+echo
+echo "--- wake on ---"
+sudo ./mtcp-guard-ctl wake on
+sleep 0.3
+sudo ./xdp_option_probe veth1 "$VETH0_MAC" 192.0.2.99 10.99.99.1 8080
+sleep 1
+sudo ./mtcp-guard-ctl stats
+echo
+echo "--- pcap size (should be unchanged) ---"
+ls -la "$PCAP"
+
+# --- 8. wake off, whitelist bypass ---
+echo
+echo "--- wake off + whitelist exact ---"
+sudo ./mtcp-guard-ctl wake off
+sudo ./mtcp-guard-ctl whitelist add 192.0.2.99
+sleep 0.3
+sudo ./xdp_option_probe veth1 "$VETH0_MAC" 192.0.2.99 10.99.99.1 8080
+sleep 1
+sudo ./mtcp-guard-ctl stats
+echo
+echo "--- pcap size (should be unchanged) ---"
+ls -la "$PCAP"
+
+# --- 9. remove whitelist, drop again ---
+echo
+echo "--- whitelist remove, drop again ---"
+sudo ./mtcp-guard-ctl whitelist remove 192.0.2.99
+sudo ./xdp_option_probe veth1 "$VETH0_MAC" 192.0.2.99 10.99.99.1 8080
+sleep 1
+sudo ./mtcp-guard-ctl stats
+echo
+echo "--- final pcap (should be 2 packets) ---"
+sudo tcpdump -r "$PCAP" -nn -c 5
+
+# --- 10. journal ---
+echo
+echo "--- daemon journal ---"
+sudo journalctl -t mtcp-guardd --since '60 seconds ago' --no-pager | tail -10

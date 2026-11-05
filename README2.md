@@ -1,4 +1,6 @@
+
 # CVE-2026-98432 XDP Guard
+# 
 
 A temporary eBPF/XDP mitigation for **CVE-2026-98432**, a TCP/IPv4-options
 processing bug. The guard inspects packets at the XDP hook, drops IPv4/TCP
@@ -73,6 +75,8 @@ README.md this file
 ---
 
 ## Requirements
+
+THIS NEEDS TO BE UPDATED TO THE ADDITIONAL HEADER LIBS
 
 ### Runtime
 

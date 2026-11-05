@@ -1,0 +1,32 @@
+# ── Build outputs (rebuilt by ./build) ─────────────────────────────
+*.o
+mtcp-guardd
+mtcp-guard-ctl
+xdp_option_probe
+out/
+
+# ── Test artifacts ─────────────────────────────────────────────────
+/tmp/drops-test-*.pcap
+*.pcap
+/tmp/test-whitelist-*.conf
+/tmp/test-whitelist-bad-*.conf
+/tmp/test-build.log
+/tmp/test-remove.log
+/tmp/test-install.log
+
+# ── Runtime / install state ────────────────────────────────────────
+/run/mtcp-guardd.pid
+*.pid
+
+# ── Editor / OS noise ──────────────────────────────────────────────
+*.swp
+*.swo
+*~
+.DS_Store
+.vscode/
+.idea/
+
+# ── Misc ───────────────────────────────────────────────────────────
+*.log
+core
+core.*

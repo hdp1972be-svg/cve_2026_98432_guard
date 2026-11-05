@@ -1,0 +1,578 @@
+#!/usr/bin/env bash
+# ============================================================================
+# Full functional test for the CVE-2026-98432 XDP guard.
+#
+# Every command's output is preserved in the transcript so the run is
+# auditable end-to-end. Coloured headers mark each section; [OK]/[FAIL]
+# are the pass/fail assertions; the raw output of every step follows
+# underneath so nothing is hidden.
+# ============================================================================
+
+set -uo pipefail
+
+if [[ -t 1 ]]; then
+    R='\033[0;31m'; G='\033[0;32m'; Y='\033[0;33m'
+    B='\033[0;34m'; C='\033[0;36m'; BOLD='\033[1m'; N='\033[0m'
+else
+    R=''; G=''; Y=''; B=''; C=''; BOLD=''; N=''
+fi
+
+HDR()  { printf "\n${BOLD}${B}══════════════════════════════════════════════════════════════${N}\n";
+         printf "${BOLD}${B}  %s${N}\n" "$*";
+         printf "${BOLD}${B}══════════════════════════════════════════════════════════════${N}\n"; }
+STEP() { printf "\n${BOLD}${C}── %s ──${N}\n" "$*"; }
+OK()   { printf "${G}  [OK]${N}   %s\n" "$*"; }
+FAIL() { printf "${R}  [FAIL]${N} %s\n" "$*"; FAILED=$((FAILED+1)); }
+INFO() { printf "${Y}  [INFO]${N} %s\n" "$*"; }
+RAW()  { printf "${C}  │ ${N}"; sed 's/^/  │ /'; }
+
+FAILED=0
+PASSED=0
+assert_eq() {
+    local expected="$1" actual="$2" what="$3"
+    if [[ "$expected" == "$actual" ]]; then
+        OK "$what (=$expected)"
+        PASSED=$((PASSED+1))
+    else
+        FAIL "$what: expected '$expected', got '$actual'"
+    fi
+}
+assert_ge() {
+    local min="$1" actual="$2" what="$3"
+    if (( actual >= min )); then
+        OK "$what (>= $min, got $actual)"
+        PASSED=$((PASSED+1))
+    else
+        FAIL "$what: expected >= $min, got $actual"
+    fi
+}
+assert_grew() {
+    local before="$1" after="$2" what="$3"
+    if (( after > before )); then
+        OK "$what ($before -> $after)"
+        PASSED=$((PASSED+1))
+    else
+        FAIL "$what: expected to grow, $before -> $after"
+    fi
+}
+assert_unchanged() {
+    local before="$1" after="$2" what="$3"
+    if (( after == before )); then
+        OK "$what (unchanged at $before)"
+        PASSED=$((PASSED+1))
+    else
+        FAIL "$what: expected unchanged, $before -> $after"
+    fi
+}
+
+PROG_PIN="/sys/fs/bpf/cve_2026_98432_guard"
+PCAP="/tmp/drops-test-$$.pcap"
+DAEMON="./mtcp-guardd"
+CTL="./mtcp-guard-ctl"
+PID_FILE="/run/mtcp-guardd.pid"
+
+read_stat() {
+    local key="$1"
+    $CTL stats 2>/dev/null | awk -v k="key $key " '$0 ~ k {
+        sub(/.*: /,""); print $1; exit
+    }' || echo 0
+}
+
+# ============================================================================
+HDR "1. Build, remove, install"
+
+STEP "Rebuild everything (./build)"
+./build 2>&1 | tee /tmp/test-build.log | RAW
+if grep -q "BUILD SUCCESSFUL" /tmp/test-build.log; then
+    OK "build succeeded"
+    PASSED=$((PASSED+1))
+else
+    FAIL "build failed"
+    exit 1
+fi
+
+STEP "Remove any previous deployment (./remove)"
+./remove 2>&1 | tee /tmp/test-remove.log | RAW
+if [[ ! -e "$PROG_PIN" ]]; then
+    OK "program pin removed"
+    PASSED=$((PASSED+1))
+else
+    FAIL "program pin still present after remove"
+fi
+
+STEP "Install the guard (./install)"
+./install 2>&1 | tee /tmp/test-install.log | RAW
+if grep -q "deployment and attachment complete" /tmp/test-install.log; then
+    OK "install succeeded"
+    PASSED=$((PASSED+1))
+else
+    FAIL "install failed"
+    exit 1
+fi
+
+STEP "Verify all seven maps are pinned"
+for m in stats whitelist whitelist_bm drop_ips events config meta; do
+    if [[ -e "/sys/fs/bpf/cve_2026_98432_$m" ]]; then
+        OK "pinned: $m"
+        PASSED=$((PASSED+1))
+    else
+        FAIL "missing pin: $m"
+    fi
+done
+
+STEP "Current XDP attachments (bpftool net show)"
+sudo bpftool net show 2>&1 | RAW
+
+# ============================================================================
+HDR "2. Daemon lifecycle"
+
+STEP "Stop any running daemon"
+if sudo test -f "$PID_FILE"; then
+    OLD="$(sudo cat "$PID_FILE")"
+    if sudo kill -0 "$OLD" 2>/dev/null; then
+        sudo kill -TERM "$OLD"
+        for _ in $(seq 1 20); do
+            sudo kill -0 "$OLD" 2>/dev/null || break
+            sleep 0.1
+        done
+        OK "stopped old daemon (pid $OLD)"
+        PASSED=$((PASSED+1))
+    fi
+fi
+sudo pkill -KILL -x mtcp-guardd 2>/dev/null || true
+
+STEP "Start fresh daemon with pcap output: $PCAP"
+#sudo rm -f "$PCAP"
+sudo "$DAEMON" -d -p "$PCAP"
+sleep 1
+NEW_PID="$(sudo cat "$PID_FILE" 2>/dev/null || true)"
+if [[ -n "$NEW_PID" ]] && sudo kill -0 "$NEW_PID" 2>/dev/null; then
+    OK "daemon running (pid $NEW_PID)"
+    PASSED=$((PASSED+1))
+else
+    FAIL "daemon did not start"
+    sudo journalctl -t mtcp-guardd --since '10 seconds ago' --no-pager | RAW
+    exit 1
+fi
+
+STEP "Startup journal sequence (full)"
+sleep 0.5
+JOURNAL="$(sudo journalctl -t mtcp-guardd --since '10 seconds ago' --no-pager)"
+printf '%s\n' "$JOURNAL" | RAW
+for line in "mtcp-guardd starting" "pcap: writing drops to" \
+            "config: wake=" "whitelist: reload from" \
+            "mtcp-guardd ready"; do
+    if grep -q "$line" <<< "$JOURNAL"; then
+        OK "journal: $line"
+        PASSED=$((PASSED+1))
+    else
+        FAIL "journal missing: $line"
+    fi
+done
+
+# ============================================================================
+HDR "3. Attach guard to lo"
+
+if sudo bpftool net show dev lo 2>/dev/null | grep -q " id "; then
+    OK "guard already attached to lo"
+    PASSED=$((PASSED+1))
+else
+    STEP "Attaching guard to lo (xdpgeneric)"
+    sudo ip link set dev lo xdpgeneric pinned "$PROG_PIN" 2>&1 | RAW
+    if [[ $? -eq 0 ]]; then
+        OK "attached to lo"
+        PASSED=$((PASSED+1))
+    else
+        FAIL "attach to lo failed"
+        exit 1
+    fi
+fi
+STEP "bpftool net show dev lo"
+sudo bpftool net show dev lo 2>&1 | RAW
+
+# ============================================================================
+HDR "4. Drop path (wake off, source not whitelisted)"
+
+STEP "Reset state"
+sudo $CTL wake off 2>&1 | RAW
+sudo $CTL whitelist remove 192.0.2.99 2>&1 | RAW || true
+sudo $CTL whitelist remove 192.0.2.0/24 2>&1 | RAW || true
+
+K0_BEFORE=$(read_stat 0)
+K1_BEFORE=$(read_stat 1)
+K2_BEFORE=$(read_stat 2)
+PCAP_BEFORE=$(stat -c %s "$PCAP" 2>/dev/null || echo 0)
+INFO "baseline: key0=$K0_BEFORE key1=$K1_BEFORE key2=$K2_BEFORE pcap=$PCAP_BEFORE"
+
+STEP "Send probe (58-byte IPv4/TCP with Record Route)"
+LO_MAC="$(cat /sys/class/net/lo/address)"
+sudo ./xdp_option_probe lo "$LO_MAC" 192.0.2.99 127.0.0.1 8080 2>&1 | RAW
+sleep 0.5
+
+STEP "mtcp-guard-ctl stats"
+sudo $CTL stats 2>&1 | RAW
+K0_AFTER=$(read_stat 0)
+K1_AFTER=$(read_stat 1)
+K2_AFTER=$(read_stat 2)
+PCAP_AFTER=$(stat -c %s "$PCAP" 2>/dev/null || echo 0)
+
+STEP "Verify counters and pcap"
+assert_grew "$K0_BEFORE" "$K0_AFTER" "key 0 (TCP/IP-options drops) grew"
+assert_unchanged "$K1_BEFORE" "$K1_AFTER" "key 1 (Malformed IPv4) unchanged"
+assert_unchanged "$K2_BEFORE" "$K2_AFTER" "key 2 (Wake bypasses) unchanged"
+assert_grew "$PCAP_BEFORE" "$PCAP_AFTER" "pcap grew (packet written)"
+
+STEP "mtcp-guard-ctl drop-ips"
+sudo $CTL drop-ips 2>&1 | RAW
+
+STEP "Journal since last probe"
+JOURNAL="$(sudo journalctl -t mtcp-guardd --since '3 seconds ago' --no-pager)"
+printf '%s\n' "$JOURNAL" | RAW
+if grep -q "drop iface=lo src_ip=192.0.2.99" <<< "$JOURNAL"; then
+    OK "journal shows 'drop iface=lo src_ip=192.0.2.99'"
+    PASSED=$((PASSED+1))
+else
+    FAIL "journal missing drop line with iface=lo and src_ip=192.0.2.99"
+fi
+
+STEP "pcap contents: tcpdump -r $PCAP -nn -vvv -XX"
+sudo tcpdump -r "$PCAP" -nn -vvv -XX 2>&1 | RAW
+
+if sudo tcpdump -r "$PCAP" -nn 2>/dev/null | grep -q "192.0.2.99.49152 > 127.0.0.1.8080.*Flags \[S\]"; then
+    OK "tcpdump parsed the frame: 192.0.2.99:49152 -> 127.0.0.1:8080, SYN"
+    PASSED=$((PASSED+1))
+else
+    FAIL "tcpdump could not parse the captured frame"
+fi
+if sudo tcpdump -r "$PCAP" -nn -vv 2>/dev/null | grep -q "options (RR"; then
+    OK "Record Route option visible in the capture (vulnerable shape preserved)"
+    PASSED=$((PASSED+1))
+else
+    FAIL "Record Route option not found in capture"
+fi
+if sudo $CTL drop-ips | grep -q "192.0.2.99: [1-9]"; then
+    OK "drop-ips lists 192.0.2.99 with count > 0"
+    PASSED=$((PASSED+1))
+else
+    FAIL "drop-ips does not list 192.0.2.99"
+fi
+
+# ============================================================================
+HDR "5. Wake bypass (wake on)"
+
+STEP "mtcp-guard-ctl wake on"
+sudo $CTL wake on 2>&1 | RAW
+K0_BEFORE=$(read_stat 0)
+K2_BEFORE=$(read_stat 2)
+PCAP_BEFORE=$(stat -c %s "$PCAP")
+
+STEP "Send probe with wake on"
+sudo ./xdp_option_probe lo "$LO_MAC" 192.0.2.99 127.0.0.1 8080 2>&1 | RAW
+sleep 0.5
+
+STEP "mtcp-guard-ctl stats"
+sudo $CTL stats 2>&1 | RAW
+K0_AFTER=$(read_stat 0)
+K2_AFTER=$(read_stat 2)
+PCAP_AFTER=$(stat -c %s "$PCAP")
+
+STEP "Verify wake-bypass behaviour"
+assert_unchanged "$K0_BEFORE" "$K0_AFTER" "key 0 (drops) unchanged"
+assert_grew "$K2_BEFORE" "$K2_AFTER" "key 2 (wake bypasses) grew"
+assert_unchanged "$PCAP_BEFORE" "$PCAP_AFTER" "pcap unchanged (no packet captured)"
+
+STEP "Journal since wake-on probe"
+sudo journalctl -t mtcp-guardd --since '3 seconds ago' --no-pager 2>&1 | RAW
+
+# ============================================================================
+HDR "6. Whitelist exact bypass"
+
+STEP "mtcp-guard-ctl wake off; whitelist add 192.0.2.99"
+sudo $CTL wake off 2>&1 | RAW
+sudo $CTL whitelist add 192.0.2.99 2>&1 | RAW
+K0_BEFORE=$(read_stat 0)
+K2_BEFORE=$(read_stat 2)
+PCAP_BEFORE=$(stat -c %s "$PCAP")
+
+STEP "mtcp-guard-ctl whitelist list"
+sudo $CTL whitelist list 2>&1 | RAW
+
+STEP "Send probe from whitelisted exact IP"
+sudo ./xdp_option_probe lo "$LO_MAC" 192.0.2.99 127.0.0.1 8080 2>&1 | RAW
+sleep 0.5
+
+STEP "mtcp-guard-ctl stats"
+sudo $CTL stats 2>&1 | RAW
+K0_AFTER=$(read_stat 0)
+K2_AFTER=$(read_stat 2)
+PCAP_AFTER=$(stat -c %s "$PCAP")
+
+STEP "Verify whitelist-exact bypass"
+assert_unchanged "$K0_BEFORE" "$K0_AFTER" "key 0 (drops) unchanged"
+assert_unchanged "$K2_BEFORE" "$K2_AFTER" "key 2 (wake bypasses) unchanged"
+assert_unchanged "$PCAP_BEFORE" "$PCAP_AFTER" "pcap unchanged"
+
+# ============================================================================
+HDR "7. Whitelist /24 bypass"
+
+STEP "mtcp-guard-ctl whitelist remove 192.0.2.99; add 192.0.2.0/24"
+sudo $CTL whitelist remove 192.0.2.99 2>&1 | RAW
+sudo $CTL whitelist add 192.0.2.0/24 2>&1 | RAW
+K0_BEFORE=$(read_stat 0)
+K2_BEFORE=$(read_stat 2)
+PCAP_BEFORE=$(stat -c %s "$PCAP")
+
+STEP "mtcp-guard-ctl whitelist list"
+sudo $CTL whitelist list 2>&1 | RAW
+
+STEP "Send probe from a /24-whitelisted source"
+sudo ./xdp_option_probe lo "$LO_MAC" 192.0.2.99 127.0.0.1 8080 2>&1 | RAW
+sleep 0.5
+
+STEP "mtcp-guard-ctl stats"
+sudo $CTL stats 2>&1 | RAW
+K0_AFTER=$(read_stat 0)
+K2_AFTER=$(read_stat 2)
+PCAP_AFTER=$(stat -c %s "$PCAP")
+
+STEP "Verify whitelist-/24 bypass"
+assert_unchanged "$K0_BEFORE" "$K0_AFTER" "key 0 (drops) unchanged"
+assert_unchanged "$K2_BEFORE" "$K2_AFTER" "key 2 (wake bypasses) unchanged"
+assert_unchanged "$PCAP_BEFORE" "$PCAP_AFTER" "pcap unchanged"
+
+sudo $CTL whitelist remove 192.0.2.0/24 2>&1 | RAW
+
+# ============================================================================
+HDR "8. Whitelist list / load / save"
+
+STEP "Populate a known set"
+sudo $CTL whitelist add 10.20.30.40 2>&1 | RAW
+sudo $CTL whitelist add 203.0.113.5 2>&1 | RAW
+sudo $CTL whitelist add 172.16.0.0/24 2>&1 | RAW
+
+STEP "mtcp-guard-ctl whitelist list (full)"
+LIST="$(sudo $CTL whitelist list)"
+printf '%s\n' "$LIST" | RAW
+
+if grep -A20 "exact IPs" <<< "$LIST" | grep -q "10.20.30.40"; then
+    OK "list: 10.20.30.40 under exact IPs"
+    PASSED=$((PASSED+1))
+else
+    FAIL "list: 10.20.30.40 not under exact IPs"
+fi
+if grep -A20 "exact IPs" <<< "$LIST" | grep -q "203.0.113.5"; then
+    OK "list: 203.0.113.5 under exact IPs"
+    PASSED=$((PASSED+1))
+else
+    FAIL "list: 203.0.113.5 not under exact IPs"
+fi
+if grep -A20 "/24 prefixes" <<< "$LIST" | grep -q "172.16.0.0/24"; then
+    OK "list: 172.16.0.0/24 under /24 prefixes"
+    PASSED=$((PASSED+1))
+else
+    FAIL "list: 172.16.0.0/24 not under /24 prefixes"
+fi
+
+STEP "Save to /tmp/test-whitelist-$$.conf"
+SAVE_FILE="/tmp/test-whitelist-$$.conf"
+sudo $CTL whitelist save "$SAVE_FILE" 2>&1 | RAW
+STEP "Saved file contents"
+sudo cat "$SAVE_FILE" 2>&1 | RAW
+if grep -q "10.20.30.40" "$SAVE_FILE" && grep -q "172.16.0.0/24" "$SAVE_FILE"; then
+    OK "save: file contains the expected entries"
+    PASSED=$((PASSED+1))
+else
+    FAIL "save: file missing expected entries"
+fi
+
+STEP "Clear and reload round-trip"
+sudo $CTL whitelist remove 10.20.30.40 2>&1 | RAW
+sudo $CTL whitelist remove 203.0.113.5 2>&1 | RAW
+sudo $CTL whitelist remove 172.16.0.0/24 2>&1 | RAW
+STEP "whitelist list after clear"
+sudo $CTL whitelist list 2>&1 | RAW
+LIST="$(sudo $CTL whitelist list)"
+if ! grep -qE "10.20.30.40|203.0.113.5|172.16.0.0/24" <<< "$LIST"; then
+    OK "clear: all test entries removed"
+    PASSED=$((PASSED+1))
+else
+    FAIL "clear: entries still present"
+fi
+
+STEP "Load from saved file"
+sudo $CTL whitelist load "$SAVE_FILE" 2>&1 | RAW
+STEP "whitelist list after load"
+sudo $CTL whitelist list 2>&1 | RAW
+LIST="$(sudo $CTL whitelist list)"
+if grep -A20 "exact IPs" <<< "$LIST" | grep -q "10.20.30.40" && \
+   grep -A20 "/24 prefixes" <<< "$LIST" | grep -q "172.16.0.0/24"; then
+    OK "load: entries restored in the correct sections"
+    PASSED=$((PASSED+1))
+else
+    FAIL "load: entries not restored"
+fi
+
+STEP "Load with a malformed file"
+BAD_FILE="/tmp/test-whitelist-bad-$$.conf"
+cat > "$BAD_FILE" <<'EOF'
+# test file
+192.0.2.1
+not-an-ip
+10.0.0.0/16
+EOF
+STEP "Malformed file contents"
+cat "$BAD_FILE" | RAW
+OUTPUT="$(sudo $CTL whitelist load "$BAD_FILE" 2>&1)"
+printf '%s\n' "$OUTPUT" | RAW
+if grep -q "invalid IP" <<< "$OUTPUT" && grep -q "only /24" <<< "$OUTPUT"; then
+    OK "load: malformed lines reported (invalid IP + unsupported prefix)"
+    PASSED=$((PASSED+1))
+else
+    FAIL "load: expected errors not reported"
+fi
+
+sudo $CTL whitelist remove 10.20.30.40 2>&1 | RAW
+sudo $CTL whitelist remove 203.0.113.5 2>&1 | RAW
+sudo $CTL whitelist remove 172.16.0.0/24 2>&1 | RAW
+sudo $CTL whitelist remove 192.0.2.1 2>&1 | RAW
+rm -f "$SAVE_FILE" "$BAD_FILE"
+
+# ============================================================================
+HDR "9. drop-ips per-source counters"
+
+STEP "Send 3 probes from 192.0.2.99 and 1 from 203.0.113.99"
+for i in 1 2 3; do
+    sudo ./xdp_option_probe lo "$LO_MAC" 192.0.2.99 127.0.0.1 8080 2>&1 | RAW
+done
+sudo ./xdp_option_probe lo "$LO_MAC" 203.0.113.99 127.0.0.1 8080 2>&1 | RAW
+sleep 0.5
+
+STEP "mtcp-guard-ctl drop-ips"
+DROP_IPS="$(sudo $CTL drop-ips)"
+printf '%s\n' "$DROP_IPS" | RAW
+
+CNT_992=$(awk -F': ' '/192\.0\.2\.99:/{print $2; exit}' <<< "$DROP_IPS")
+CNT_113=$(awk -F': ' '/203\.0\.113\.99:/{print $2; exit}' <<< "$DROP_IPS")
+
+if [[ -n "$CNT_992" ]] && (( CNT_992 >= 3 )); then
+    OK "drop-ips: 192.0.2.99 counted at least 3 times (got $CNT_992)"
+    PASSED=$((PASSED+1))
+else
+    FAIL "drop-ips: 192.0.2.99 count < 3 (got ${CNT_992:-none})"
+fi
+if [[ "$CNT_113" == "1" ]]; then
+    OK "drop-ips: 203.0.113.99 counted exactly 1 time"
+    PASSED=$((PASSED+1))
+else
+    FAIL "drop-ips: 203.0.113.99 count wrong (got ${CNT_113:-none})"
+fi
+
+# ============================================================================
+HDR "10. Stats per-CPU aggregation"
+
+STEP "mtcp-guard-ctl stats (full)"
+STATS="$(sudo $CTL stats)"
+printf '%s\n' "$STATS" | RAW
+
+KEY0_TOTAL="$(awk '/key 0 /{sub(/.*: /,""); print $1; exit}' <<< "$STATS")"
+KEY0_SUM="$(awk '
+    /key 0 / { in0=1; next }
+    /key 1 / { in0=0 }
+    in0 && /cpu [0-9]+:/ {
+        n = split($0, a, ":")
+        gsub(/[^0-9]/, "", a[n])
+        sum += a[n]
+    }
+    END { print sum+0 }
+' <<< "$STATS")"
+assert_eq "$KEY0_TOTAL" "$KEY0_SUM" "key 0 total matches sum of per-CPU counts"
+
+STEP "Verify the stats block lists all three keys"
+for k in 0 1 2; do
+    if grep -q "key $k " <<< "$STATS"; then
+        OK "stats: key $k present"
+        PASSED=$((PASSED+1))
+    else
+        FAIL "stats: key $k missing"
+    fi
+done
+
+# ============================================================================
+HDR "11. SIGHUP reload"
+
+STEP "mtcp-guard-ctl wake on; kill -HUP <daemon>"
+sudo $CTL wake on 2>&1 | RAW
+sudo kill -HUP "$(sudo cat "$PID_FILE")"
+sleep 0.5
+
+STEP "Journal since SIGHUP"
+JOURNAL="$(sudo journalctl -t mtcp-guardd --since '3 seconds ago' --no-pager)"
+printf '%s\n' "$JOURNAL" | RAW
+
+if grep -q "received SIGHUP, reloading" <<< "$JOURNAL"; then
+    OK "journal: SIGHUP received"
+    PASSED=$((PASSED+1))
+else
+    FAIL "journal: SIGHUP not seen"
+fi
+if grep -q "config: wake=1" <<< "$JOURNAL"; then
+    OK "journal: reload reported wake=1 (matches the value we set)"
+    PASSED=$((PASSED+1))
+else
+    FAIL "journal: reload did not report wake=1"
+fi
+sudo $CTL wake off 2>&1 | RAW
+
+# ============================================================================
+HDR "12. Final pcap inspection"
+
+PCAP_SIZE=$(stat -c %s "$PCAP")
+PCAP_RECORDS=$(sudo tcpdump -r "$PCAP" -nn 2>/dev/null | wc -l)
+INFO "pcap path:    $PCAP"
+INFO "pcap size:    $PCAP_SIZE bytes"
+INFO "pcap records: $PCAP_RECORDS"
+
+STEP "Full pcap contents: tcpdump -r $PCAP -nn -vv -XX"
+sudo tcpdump -r "$PCAP" -nn -vv -XX 2>&1 | RAW
+
+if (( PCAP_RECORDS >= 5 )); then
+    OK "pcap contains at least 5 packets"
+    PASSED=$((PASSED+1))
+else
+    FAIL "pcap has fewer packets than expected"
+fi
+
+STEP "Verify every record parses as IPv4"
+BAD=0
+while read -r line; do
+    if [[ -n "$line" ]] && ! grep -q "IP " <<< "$line"; then
+        BAD=$((BAD+1))
+    fi
+done < <(sudo tcpdump -r "$PCAP" -nn 2>/dev/null)
+if (( BAD == 0 )); then
+    OK "all pcap records parse as IPv4"
+    PASSED=$((PASSED+1))
+else
+    FAIL "$BAD pcap records did not parse as IPv4"
+fi
+
+# ============================================================================
+HDR "Test summary"
+
+TOTAL=$((PASSED + FAILED))
+printf "  ${BOLD}Checks:${N} %d   ${G}passed: %d${N}   " "$TOTAL" "$PASSED"
+if (( FAILED > 0 )); then
+    printf "${R}failed: %d${N}\n" "$FAILED"
+else
+    printf "${G}failed: 0${N}\n"
+fi
+
+if (( FAILED == 0 )); then
+    printf "\n  ${BOLD}${G}ALL TESTS PASSED${N}\n\n"
+    rm -f "$PCAP"
+    exit 0
+else
+    printf "\n  ${BOLD}${R}SOME TESTS FAILED${N}\n"
+    printf "  pcap kept at %s for inspection\n\n" "$PCAP"
+    exit 1
+fi

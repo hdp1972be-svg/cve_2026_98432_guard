@@ -1,0 +1,27 @@
+# Detach from lo (clean slate)
+sudo ip link set dev lo xdp off 2>/dev/null || true
+
+# Create veth pair
+sudo ip link add veth0 type veth peer name veth1
+sudo ip link set veth0 up
+sudo ip link set veth1 up
+
+# Attach the guard to veth0 (the receiving side)
+sudo ip link set dev veth0 xdpgeneric pinned /sys/fs/bpf/cve_2026_98432_guard
+sudo bpftool net show dev veth0
+
+# Restart the daemon with pcap
+sudo pkill -TERM -x mtcp-guardd 2>/dev/null || true
+sleep 1
+sudo rm -f /tmp/drops.pcap
+sudo ./mtcp-guardd -d -p /tmp/drops.pcap
+sleep 1
+
+# Send the probe into veth1; it arrives on veth0
+VETH1_MAC=$(cat /sys/class/net/veth1/address)
+sudo ./xdp_option_probe veth1 "$VETH1_MAC" 192.0.2.99 10.99.99.1 8080
+
+sleep 1
+journalctl -t mtcp-guardd --since '10 seconds ago' --no-pager | tail -3
+ls -la /tmp/drops.pcap
+sudo tcpdump -r /tmp/drops.pcap -nn -vvv -XX

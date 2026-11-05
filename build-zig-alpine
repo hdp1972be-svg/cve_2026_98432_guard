@@ -1,0 +1,651 @@
+#!/bin/bash
+# ============================================================================
+# build-zig-alpine.sh
+#
+# Cross-build static userspace binaries for embedded targets using zig cc.
+#
+# Builds a musl sysroot per target architecture using Alpine minirootfs
+# + chroot. For non-host architectures (aarch64 on x86_64), qemu-user-static
+# is used to run the aarch64 chroot transparently.
+#
+# libbpf is built from source inside the target chroot.
+#
+# AArch64:
+#   - Builds libbpf with GCC -mno-outline-atomics.
+#   - Prevents compiler-generated __aarch64_* outline atomic helper references.
+#   - Checks the resulting libbpf.a before installation.
+#   - Refuses to copy an archive containing unresolved AArch64 helpers.
+#
+# The chroot, APK package cache and libbpf source tree are reused.
+#
+# Usage:
+#   sudo ./build-zig-alpine.sh --make-sysroot
+#   ./build-zig-alpine.sh
+# ============================================================================
+
+set -euo pipefail
+
+if [[ -t 1 ]]; then
+    R='\033[0;31m'; G='\033[0;32m'; Y='\033[0;33m'
+    B='\033[0;34m'; C='\033[0;36m'; BOLD='\033[1m'; N='\033[0m'
+else
+    R=''; G=''; Y=''; B=''; C=''; BOLD=''; N=''
+fi
+
+ok()   { printf "${G}[OK]${N}   %s\n" "$*"; }
+warn() { printf "${Y}[WARN]${N} %s\n" "$*"; }
+info() { printf "${B}[INFO]${N} %s\n" "$*"; }
+err()  { printf "${R}[ERR]${N}  %s\n" "$*" >&2; }
+
+SRC_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SRC_ROOT"
+
+SRC_DIR="$SRC_ROOT/src"
+OUT_BASE="$SRC_ROOT/out/zig"
+CHROOT_BASE="$SRC_ROOT/out/alpine-chroot"
+
+ZIG="${ZIG:-zig}"
+MAKE_SYSROOT=0
+ONLY_TARGET=""
+
+ALPINE_VERSION="3.20"
+ALPINE_FULL="3.20.3"
+
+LIBBPF_VERSION="1.4.2"
+
+# ---------------------------------------------------------------------------
+# Cleanup trap
+# ---------------------------------------------------------------------------
+
+declare -a MOUNTED_CHROOTS=()
+
+cleanup_chroot_mounts() {
+    local d
+
+    for d in "${MOUNTED_CHROOTS[@]}"; do
+        if [[ -n "$d" ]] && mountpoint -q "$d/dev" 2>/dev/null; then
+            umount "$d/dev" 2>/dev/null || true
+        fi
+
+        if [[ -n "$d" ]] && mountpoint -q "$d/proc" 2>/dev/null; then
+            umount "$d/proc" 2>/dev/null || true
+        fi
+    done
+}
+
+trap cleanup_chroot_mounts EXIT INT TERM
+
+# ---------------------------------------------------------------------------
+# Arguments
+# ---------------------------------------------------------------------------
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --make-sysroot)
+            MAKE_SYSROOT=1
+            shift
+            ;;
+
+        --target)
+            [[ $# -ge 2 ]] || {
+                err "--target requires a value"
+                exit 2
+            }
+            ONLY_TARGET="$2"
+            shift 2
+            ;;
+
+        --target=*)
+            ONLY_TARGET="${1#*=}"
+            shift
+            ;;
+
+        -h|--help)
+            cat <<'EOF'
+Usage: ./build-zig-alpine.sh [OPTIONS]
+
+Options:
+  --make-sysroot        Build musl sysroots for all target architectures.
+                        Requires root and qemu-user-static for cross-arch.
+  --target TARGET       Only build for TARGET (default: both).
+  -h, --help            Show this help.
+
+Targets:
+  x86_64-linux-musl
+  aarch64-linux-musl
+
+Environment:
+  ZIG                   Path to zig binary (default: zig on PATH).
+EOF
+            exit 0
+            ;;
+
+        *)
+            err "Unknown argument: $1"
+            exit 2
+            ;;
+    esac
+done
+
+TARGETS=(
+    "x86_64-linux-musl"
+    "aarch64-linux-musl"
+)
+
+if [[ -n "$ONLY_TARGET" ]]; then
+    TARGETS=("$ONLY_TARGET")
+fi
+
+# ---------------------------------------------------------------------------
+# Architecture helpers
+# ---------------------------------------------------------------------------
+
+target_to_arch() {
+    case "$1" in
+        x86_64-linux-musl)
+            echo "x86_64"
+            ;;
+        aarch64-linux-musl)
+            echo "aarch64"
+            ;;
+        *)
+            echo ""
+            ;;
+    esac
+}
+
+qemu_for_arch() {
+    case "$1" in
+        x86_64)
+            echo ""
+            ;;
+        aarch64)
+            echo "qemu-aarch64-static"
+            ;;
+        *)
+            echo ""
+            ;;
+    esac
+}
+
+# ---------------------------------------------------------------------------
+# Build sysroot for one target
+# ---------------------------------------------------------------------------
+
+make_sysroot_for_target() {
+    local target="$1"
+    local arch
+
+    arch="$(target_to_arch "$target")"
+
+    if [[ -z "$arch" ]]; then
+        err "unknown target: $target"
+        return 1
+    fi
+
+    local host_arch
+    host_arch="$(uname -m)"
+
+    local qemu_bin
+    qemu_bin="$(qemu_for_arch "$arch")"
+
+    if [[ "$arch" != "$host_arch" ]] && [[ -n "$qemu_bin" ]]; then
+        if ! command -v "$qemu_bin" >/dev/null 2>&1; then
+            err "qemu-user-static not found: $qemu_bin"
+            err "install qemu-user-static (Debian/Ubuntu: apt install qemu-user-static)"
+            err "or qemu-aarch64 (Alpine: apk add qemu-aarch64)"
+            return 1
+        fi
+    fi
+
+    local chroot_dir="$CHROOT_BASE-$arch"
+    local sysroot_dir="$SRC_ROOT/out/musl-sysroot-$arch"
+
+    local tarball="alpine-minirootfs-${ALPINE_FULL}-${arch}.tar.gz"
+    local url="https://dl-cdn.alpinelinux.org/alpine/v${ALPINE_VERSION}/releases/${arch}/${tarball}"
+
+    info "building musl sysroot for $target ($arch)"
+    info "  chroot:  $chroot_dir"
+    info "  sysroot: $sysroot_dir"
+
+    if [[ -n "$qemu_bin" ]] && [[ "$arch" != "$host_arch" ]]; then
+        info "  qemu:    $qemu_bin"
+    fi
+
+    # Remove mounts left by an interrupted previous run.
+    if mountpoint -q "$chroot_dir/dev" 2>/dev/null; then
+        umount "$chroot_dir/dev" 2>/dev/null || true
+    fi
+
+    if mountpoint -q "$chroot_dir/proc" 2>/dev/null; then
+        umount "$chroot_dir/proc" 2>/dev/null || true
+    fi
+
+    mkdir -p "$sysroot_dir"
+
+    # Reuse existing Alpine rootfs.
+    if [[ -d "$chroot_dir" ]] && [[ -f "$chroot_dir/etc/alpine-release" ]]; then
+        info "reusing existing chroot: $chroot_dir"
+    else
+        rm -rf "$chroot_dir"
+        mkdir -p "$chroot_dir"
+
+        info "downloading minirootfs"
+
+        if command -v curl >/dev/null 2>&1; then
+            curl -fLo "/tmp/$tarball" "$url"
+        elif command -v wget >/dev/null 2>&1; then
+            wget -O "/tmp/$tarball" "$url"
+        else
+            err "curl or wget required"
+            return 1
+        fi
+
+        info "extracting minirootfs"
+        tar -xzf "/tmp/$tarball" -C "$chroot_dir"
+        rm -f "/tmp/$tarball"
+    fi
+
+    cp -p /etc/resolv.conf "$chroot_dir/etc/resolv.conf" 2>/dev/null || true
+
+    if mount -t proc none "$chroot_dir/proc" 2>/dev/null; then
+        :
+    fi
+
+    if mount -t devtmpfs none "$chroot_dir/dev" 2>/dev/null; then
+        :
+    elif mount --bind /dev "$chroot_dir/dev" 2>/dev/null; then
+        :
+    else
+        mkdir -p "$chroot_dir/dev"
+
+        if [[ -e /dev/urandom ]] && [[ -e /dev/random ]]; then
+            mknod "$chroot_dir/dev/urandom" c 1 9 2>/dev/null || true
+            mknod "$chroot_dir/dev/random" c 1 8 2>/dev/null || true
+
+            chmod 666 \
+                "$chroot_dir/dev/urandom" \
+                "$chroot_dir/dev/random" 2>/dev/null || true
+        fi
+    fi
+
+    MOUNTED_CHROOTS+=("$chroot_dir")
+
+    local chroot_cmd="/bin/sh"
+
+    if [[ -n "$qemu_bin" ]] && [[ "$arch" != "$host_arch" ]]; then
+        cp "$(command -v "$qemu_bin")" "$chroot_dir/usr/bin/"
+        chroot_cmd="/usr/bin/$qemu_bin /bin/sh"
+    fi
+
+    # Install build dependencies.
+    info "installing build dependencies inside chroot"
+
+    if ! chroot "$chroot_dir" $chroot_cmd -c '
+        set -e
+
+        mkdir -p /var/cache/apk
+        ln -sf /var/cache/apk /etc/apk/cache
+
+        apk update
+
+        apk add --no-cache \
+            musl-dev \
+            linux-headers \
+            elfutils-dev \
+            zlib-static \
+            zstd-static \
+            libpcap-dev \
+            gcc \
+            make \
+            git \
+            ca-certificates \
+            binutils
+    '; then
+        err "apk install inside chroot failed for $arch"
+        return 1
+    fi
+
+    # -----------------------------------------------------------------------
+    # Build libbpf with architecture-specific compiler flags.
+    # -----------------------------------------------------------------------
+
+    info "building libbpf ${LIBBPF_VERSION} from source"
+
+    local libbpf_cc="gcc"
+
+    if [[ "$arch" == "aarch64" ]]; then
+        libbpf_cc="gcc -mno-outline-atomics"
+        info "AArch64 libbpf compiler: $libbpf_cc"
+    fi
+
+    if ! chroot "$chroot_dir" $chroot_cmd -c "
+        set -e
+
+        cd /tmp
+
+        if [[ ! -d libbpf ]]; then
+            git clone --depth 1 --branch v${LIBBPF_VERSION} https://github.com/libbpf/libbpf.git
+        fi
+
+        rm -rf libbpf-install
+
+        cd libbpf/src
+
+        make clean
+
+        echo 'Compiler: ${libbpf_cc}'
+        echo 'CFLAGS:   -O2 -g -fPIC'
+
+        make V=1 \
+            CC='${libbpf_cc}' \
+            CFLAGS='-O2 -g -fPIC' \
+            -j\$(nproc)
+
+        # Validate the archive BEFORE installation.
+        if [[ ! -f libbpf.a ]]; then
+            echo 'ERROR: libbpf.a was not produced'
+            exit 1
+        fi
+
+        if [[ '${arch}' == 'aarch64' ]]; then
+            echo 'Checking libbpf.a for unresolved AArch64 helpers...'
+
+            if nm -A -u libbpf.a | grep -E '(^|[[:space:]])__aarch64_[[:alnum:]_]+$'; then
+                echo 'ERROR: libbpf.a still contains unresolved AArch64 helper references'
+                echo 'The AArch64 libbpf build is rejected.'
+                exit 1
+            fi
+
+            echo 'OK: no unresolved __aarch64_* references in libbpf.a'
+        fi
+
+        make install DESTDIR=/tmp/libbpf-install PREFIX=/usr
+    "; then
+        err "libbpf build or validation inside chroot failed for $arch"
+        return 1
+    fi
+
+    # -----------------------------------------------------------------------
+    # Copy validated static libraries and headers to sysroot.
+    # -----------------------------------------------------------------------
+
+    info "copying .a files and headers to sysroot"
+
+    mkdir -p "$sysroot_dir/usr/lib" "$sysroot_dir/usr/include"
+
+    local found_libbpf
+
+    found_libbpf="$(
+        find "$chroot_dir/tmp/libbpf-install" \
+            -name 'libbpf.a' -type f 2>/dev/null |
+            head -1
+    )"
+
+    if [[ -z "$found_libbpf" ]]; then
+        err "libbpf.a not found in /tmp/libbpf-install"
+        return 1
+    fi
+
+    # Copy only after the in-chroot validation has succeeded.
+    cp "$found_libbpf" "$sysroot_dir/usr/lib/"
+    info "  copied validated libbpf.a from $found_libbpf"
+
+    if [[ -d "$chroot_dir/tmp/libbpf-install/usr/include" ]]; then
+        cp -r "$chroot_dir"/tmp/libbpf-install/usr/include/* \
+            "$sysroot_dir/usr/include/" 2>/dev/null || true
+    fi
+
+    local lib
+    local found
+
+    for lib in libelf.a libz.a libzstd.a libpcap.a; do
+        found="$(
+            find "$chroot_dir" -name "$lib" -type f 2>/dev/null |
+                head -1
+        )"
+
+        if [[ -n "$found" ]]; then
+            cp "$found" "$sysroot_dir/usr/lib/"
+            info "  copied $lib"
+        else
+            if [[ "$lib" == "libpcap.a" ]]; then
+                warn "  $lib not found; daemon without pcap"
+            else
+                warn "  $lib not found in chroot"
+            fi
+        fi
+    done
+
+    # Required libraries.
+    for lib in libbpf.a libelf.a libz.a libzstd.a; do
+        if [[ ! -f "$sysroot_dir/usr/lib/$lib" ]]; then
+            err "missing $lib in $arch sysroot"
+            return 1
+        fi
+    done
+
+    # Unmount before returning.
+    if mountpoint -q "$chroot_dir/dev" 2>/dev/null; then
+        umount "$chroot_dir/dev" 2>/dev/null || true
+    fi
+
+    if mountpoint -q "$chroot_dir/proc" 2>/dev/null; then
+        umount "$chroot_dir/proc" 2>/dev/null || true
+    fi
+
+    ok "sysroot ready: $sysroot_dir"
+
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# Sysroot mode
+# ---------------------------------------------------------------------------
+
+if (( MAKE_SYSROOT )); then
+    if [[ $EUID -ne 0 ]]; then
+        err "--make-sysroot requires root (chroot and apk)"
+        exit 1
+    fi
+
+    for target in "${TARGETS[@]}"; do
+        if ! make_sysroot_for_target "$target"; then
+            err "sysroot build failed for $target"
+            exit 1
+        fi
+    done
+
+    ok "all sysroots ready"
+    info "rerun without --make-sysroot to build the binaries"
+
+    exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# Preflight
+# ---------------------------------------------------------------------------
+
+if ! command -v "$ZIG" >/dev/null 2>&1 &&
+   [[ ! -x "$ZIG" ]]; then
+    err "zig not found: $ZIG"
+    exit 1
+fi
+
+info "zig: $("$ZIG" version 2>/dev/null || echo unknown)"
+
+if [[ ! -d "$SRC_DIR" ]]; then
+    err "source directory not found: $SRC_DIR"
+    exit 1
+fi
+
+for f in mtcp-guard-ctl.c mtcp-guardd.c; do
+    [[ -r "$SRC_DIR/$f" ]] || {
+        err "missing source: $SRC_DIR/$f"
+        exit 1
+    }
+done
+
+# ---------------------------------------------------------------------------
+# Per-target build
+# ---------------------------------------------------------------------------
+
+for target in "${TARGETS[@]}"; do
+    arch="$(target_to_arch "$target")"
+
+    if [[ -z "$arch" ]]; then
+        err "unknown target: $target"
+        exit 1
+    fi
+
+    sysroot_dir="$SRC_ROOT/out/musl-sysroot-$arch"
+    outdir="$OUT_BASE/$target"
+
+    mkdir -p "$outdir"
+
+    printf "\n${BOLD}${B}══════════════════════════════════════════════════════════════${N}\n"
+    printf "${BOLD}${B}  target: %s${N}\n" "$target"
+    printf "${BOLD}${B}══════════════════════════════════════════════════════════════${N}\n"
+
+    if [[ ! -d "$sysroot_dir/usr/lib" ]]; then
+        err "no sysroot for $target"
+        err "run: sudo ./build-zig-alpine.sh --make-sysroot"
+        exit 1
+    fi
+
+    info "sysroot: $sysroot_dir"
+
+    for lib in libbpf.a libelf.a libz.a libzstd.a; do
+        [[ -f "$sysroot_dir/usr/lib/$lib" ]] || {
+            err "missing $lib in $sysroot_dir/usr/lib"
+            exit 1
+        }
+    done
+
+    PCAP_AVAILABLE=0
+
+    if [[ -f "$sysroot_dir/usr/lib/libpcap.a" ]] &&
+       [[ -r "$SRC_DIR/pcap_writer.c" ]] &&
+       [[ -r "$SRC_DIR/pcap_writer.h" ]]; then
+        PCAP_AVAILABLE=1
+    fi
+
+    # Explicit archive paths.
+    BPF_LIB="$sysroot_dir/usr/lib/libbpf.a"
+    ELF_LIB="$sysroot_dir/usr/lib/libelf.a"
+    Z_LIB="$sysroot_dir/usr/lib/libz.a"
+    ZSTD_LIB="$sysroot_dir/usr/lib/libzstd.a"
+    PCAP_LIB="$sysroot_dir/usr/lib/libpcap.a"
+
+    LIBS_BASE=(
+        "$BPF_LIB"
+        "$ELF_LIB"
+        "$Z_LIB"
+        "$ZSTD_LIB"
+    )
+
+    # Linker group handles circular dependencies between static archives.
+    LIBS_GROUP=(
+        -Wl,--start-group
+        "${LIBS_BASE[@]}"
+    )
+
+    ZIG_CC=(
+        "$ZIG" cc
+        -target "$target"
+        -static
+        -O2
+        -L"$sysroot_dir/usr/lib"
+        -I"$sysroot_dir/usr/include"
+    )
+
+    # -----------------------------------------------------------------------
+    # Build mtcp-guard-ctl
+    # -----------------------------------------------------------------------
+
+    info "building mtcp-guard-ctl"
+
+    if ! "${ZIG_CC[@]}" \
+        -o "$outdir/mtcp-guard-ctl" \
+        "$SRC_DIR/mtcp-guard-ctl.c" \
+        "${LIBS_GROUP[@]}" \
+        -Wl,--end-group; then
+
+        err "mtcp-guard-ctl failed to link for $target"
+        exit 1
+    fi
+
+    ok "mtcp-guard-ctl: $outdir/mtcp-guard-ctl"
+
+    # -----------------------------------------------------------------------
+    # Build mtcp-guardd
+    # -----------------------------------------------------------------------
+
+    info "building mtcp-guardd"
+
+    built=0
+
+    if (( PCAP_AVAILABLE )); then
+        if "${ZIG_CC[@]}" \
+            -I"$SRC_DIR" \
+            -DHAVE_PCAP \
+            -o "$outdir/mtcp-guardd" \
+            "$SRC_DIR/mtcp-guardd.c" \
+            "$SRC_DIR/pcap_writer.c" \
+            -Wl,--start-group \
+            "${LIBS_BASE[@]}" \
+            "$PCAP_LIB" \
+            -Wl,--end-group; then
+
+            built=1
+            ok "mtcp-guardd: $outdir/mtcp-guardd (with pcap)"
+        fi
+    fi
+
+    if (( !built )); then
+        if "${ZIG_CC[@]}" \
+            -o "$outdir/mtcp-guardd" \
+            "$SRC_DIR/mtcp-guardd.c" \
+            "${LIBS_GROUP[@]}" \
+            -Wl,--end-group; then
+
+            built=1
+            ok "mtcp-guardd: $outdir/mtcp-guardd (no pcap)"
+        fi
+    fi
+
+    if (( !built )); then
+        err "mtcp-guardd failed to link for $target"
+        exit 1
+    fi
+
+    # -----------------------------------------------------------------------
+    # Verify static binaries
+    # -----------------------------------------------------------------------
+
+    for bin in mtcp-guard-ctl mtcp-guardd; do
+        if file "$outdir/$bin" | grep -q "statically linked"; then
+            ok "$bin: statically linked"
+        else
+            err "$bin: NOT statically linked"
+            exit 1
+        fi
+    done
+
+    (
+        cd "$outdir"
+        sha256sum mtcp-guard-ctl mtcp-guardd > SHA256SUMS
+    )
+
+    ok "checksums: $outdir/SHA256SUMS"
+done
+
+# ---------------------------------------------------------------------------
+# Complete
+# ---------------------------------------------------------------------------
+
+printf "\n${BOLD}${G}MULTI-ZIG BUILD COMPLETE${N}\n"
+
+for target in "${TARGETS[@]}"; do
+    printf "  %-24s %s\n" "$target" "$OUT_BASE/$target/"
+done

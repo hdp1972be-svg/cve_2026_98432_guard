@@ -1,0 +1,120 @@
+#!/usr/bin/env bash
+# Test capture end-to-end with a fresh daemon.
+set -uo pipefail
+
+sudo ./build
+sudo ./remove
+sudo ./install
+
+PROG_PIN="/sys/fs/bpf/cve_2026_98432_guard"
+PCAP="/tmp/drops.pcap"
+DAEMON="./mtcp-guardd"
+PID_FILE="/run/mtcp-guardd.pid"
+
+# ---- 1. Stop any running daemon ----
+if sudo test -f "$PID_FILE"; then
+    OLD_PID="$(sudo cat "$PID_FILE" 2>/dev/null || true)"
+    if [[ -n "$OLD_PID" ]] && sudo kill -0 "$OLD_PID" 2>/dev/null; then
+        echo "[+] stopping mtcp-guardd (pid $OLD_PID)"
+        sudo kill -TERM "$OLD_PID" 2>/dev/null || true
+        for _ in $(seq 1 20); do
+            sudo kill -0 "$OLD_PID" 2>/dev/null || break
+            sleep 0.1
+        done
+        if sudo kill -0 "$OLD_PID" 2>/dev/null; then
+            echo "[!] still alive after TERM, sending KILL"
+            sudo kill -KILL "$OLD_PID" 2>/dev/null || true
+        fi
+    fi
+else
+    echo "[+] no pid file at $PID_FILE"
+fi
+
+# Belt and braces.
+STRAYS="$(pgrep -x mtcp-guardd || true)"
+if [[ -n "$STRAYS" ]]; then
+    echo "[+] killing stray mtcp-guardd: $STRAYS"
+    sudo pkill -TERM -x mtcp-guardd 2>/dev/null || true
+    sleep 0.5
+    sudo pkill -KILL -x mtcp-guardd 2>/dev/null || true
+fi
+
+if pgrep -x mtcp-guardd >/dev/null; then
+    echo "[!] mtcp-guardd still running: $(pgrep -x mtcp-guardd)"
+    exit 1
+fi
+echo "[+] no mtcp-guardd processes"
+
+# ---- 2. Clear stale pcap ----
+sudo rm -f "$PCAP"
+
+# ---- 3. Start a fresh daemon ----
+sudo "$DAEMON" -d -p "$PCAP"
+sleep 1
+
+NEW_PID="$(sudo cat "$PID_FILE" 2>/dev/null || true)"
+if [[ -z "$NEW_PID" ]] || ! sudo kill -0 "$NEW_PID" 2>/dev/null; then
+    echo "[!] daemon did not start; check journalctl -t mtcp-guardd"
+    sudo journalctl -t mtcp-guardd --since '10 seconds ago' --no-pager | tail -10
+    exit 1
+fi
+echo "[+] mtcp-guardd running as pid $NEW_PID"
+
+sudo journalctl -t mtcp-guardd --since '5 seconds ago' --no-pager | tail -5
+
+# ---- 4. Attach the guard to lo (idempotent) ----
+if ! sudo bpftool net show dev lo 2>/dev/null | grep -q " id "; then
+    echo "[+] attaching guard to lo"
+    sudo ip link set dev lo xdpgeneric pinned "$PROG_PIN" || {
+        echo "[!] attach failed"; exit 1; }
+else
+    echo "[+] guard already attached to lo"
+fi
+sudo bpftool net show dev lo
+
+# ---- 5. Send the probe ----
+LO_MAC="$(cat /sys/class/net/lo/address)"
+echo "[+] sending probe (58-byte IPv4/TCP with Record Route on lo)"
+sudo ./xdp_option_probe lo "$LO_MAC" 192.0.2.99 127.0.0.1 8080
+
+sleep 1
+
+# ---- 6. Check journal and pcap ----
+echo
+echo "[+] journal (last 10s):"
+sudo journalctl -t mtcp-guardd --since '10 seconds ago' --no-pager | tail -3
+
+echo
+echo "[+] pcap file:"
+ls -la "$PCAP"
+
+echo
+echo "[+] pcap contents:"
+sudo tcpdump -r "$PCAP" -nn -vvv -XX
+
+# extended feature test
+
+sudo ./mtcp-guard-ctl wake on
+sudo ./xdp_option_probe lo "$(cat /sys/class/net/lo/address)" 192.0.2.99 127.0.0.1 8080
+sudo ./mtcp-guard-ctl stats
+# key 0 unchanged, key 2 = 1
+
+sudo ./mtcp-guard-ctl wake off
+sudo ./mtcp-guard-ctl whitelist add 192.0.2.99
+sudo ./xdp_option_probe lo "$(cat /sys/class/net/lo/address)" 192.0.2.99 127.0.0.1 8080
+sudo ./mtcp-guard-ctl stats
+# key 0 unchanged, key 2 unchanged
+
+sudo ./mtcp-guard-ctl whitelist remove 192.0.2.99
+sudo ./xdp_option_probe lo "$(cat /sys/class/net/lo/address)" 192.0.2.99 127.0.0.1 8080
+sudo ./mtcp-guard-ctl stats
+# key 0 = 2
+
+sudo ./mtcp-guard-ctl whitelist add 192.0.2.0/24
+sudo ./xdp_option_probe lo "$(cat /sys/class/net/lo/address)" 192.0.2.99 127.0.0.1 8080
+sudo ./mtcp-guard-ctl stats
+# key 0 unchanged
+sudo ./mtcp-guard-ctl whitelist remove 192.0.2.0/24
+
+sudo tcpdump -r /tmp/drops.pcap -nn -c 5
+# 2 packets

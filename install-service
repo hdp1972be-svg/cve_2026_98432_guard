@@ -5,8 +5,9 @@
 # Install the systemd units for the CVE-2026-98432 XDP guard, deploy the
 # whitelist, and enable both the loader and the daemon.
 #
-# Run once after the repository binaries have been built and deployed
-# (./build, sudo ./install) and before you reboot. Requires root.
+# Unit files and whitelist.conf are read from ./services/ next to this
+# script. Run once after the repository binaries have been built and
+# deployed (./build, sudo ./install) and before you reboot. Requires root.
 #
 # Idempotent: safe to run repeatedly. Resets failed unit state so a
 # previous bad attempt doesn't block a clean re-run.
@@ -21,6 +22,7 @@ set -euo pipefail
 
 # --- paths ---------------------------------------------------------------
 SRC_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+SVC_DIR="$SRC_DIR/services"
 
 GUARD_DIR="/etc/cve-2026-98432-guard"
 UNIT_DIR="/etc/systemd/system"
@@ -29,9 +31,14 @@ LOADER_UNIT="mtcp-guard-load.service"
 DAEMON_UNIT="mtcp-guardd.service"
 
 # --- sanity --------------------------------------------------------------
+if [[ ! -d "$SVC_DIR" ]]; then
+    echo "[-] services directory not found: $SVC_DIR" >&2
+    exit 1
+fi
+
 for f in "$LOADER_UNIT" "$DAEMON_UNIT" "whitelist.conf"; do
-    if [[ ! -r "$SRC_DIR/$f" ]]; then
-        echo "[-] missing source file: $SRC_DIR/$f" >&2
+    if [[ ! -r "$SVC_DIR/$f" ]]; then
+        echo "[-] missing source file: $SVC_DIR/$f" >&2
         exit 1
     fi
 done
@@ -47,14 +54,14 @@ echo "[+] ensuring $GUARD_DIR exists"
 sudo install -d -m 0755 "$GUARD_DIR"
 
 echo "[+] installing systemd units into $UNIT_DIR"
-sudo install -m 0644 "$SRC_DIR/$LOADER_UNIT" "$UNIT_DIR/$LOADER_UNIT"
-sudo install -m 0644 "$SRC_DIR/$DAEMON_UNIT" "$UNIT_DIR/$DAEMON_UNIT"
+sudo install -m 0644 "$SVC_DIR/$LOADER_UNIT" "$UNIT_DIR/$LOADER_UNIT"
+sudo install -m 0644 "$SVC_DIR/$DAEMON_UNIT" "$UNIT_DIR/$DAEMON_UNIT"
 
 if [[ -e "$GUARD_DIR/whitelist.conf" ]]; then
     echo "[+] $GUARD_DIR/whitelist.conf already exists; leaving it untouched"
 else
     echo "[+] installing whitelist.conf into $GUARD_DIR"
-    sudo install -m 0644 "$SRC_DIR/whitelist.conf" \
+    sudo install -m 0644 "$SVC_DIR/whitelist.conf" \
         "$GUARD_DIR/whitelist.conf"
 fi
 

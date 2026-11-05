@@ -1,16 +1,22 @@
 #!/usr/bin/env bash
-# remove — remove the cve_2026_98432 XDP BPF filter only.
 #
-# This script removes the runtime BPF filter (pinned program + maps, XDP
-# attachments, daemon stop, PID file). It intentionally does NOT remove:
-#   - systemd unit files (mtcp-guard.service, mtcp-guardd.service)
-#   - /etc/cve-2026_98432_guard/ directory and whitelist.conf
+# remove — remove only the cve_2026_98432 XDP BPF filter.
+#
+# Identifies the guard by its kernel-visible XDP program name.
+# Detaches only interfaces carrying that exact program ID.
+# Removes program and map pins only after attachment verification.
+#
+# Safety:
+#   - Never detaches an unrelated XDP program.
+#   - Never uses a blanket XDP detach as a fallback.
+#   - Requires exactly one matching guard program.
+#   - Retains pins if identification or detachment fails.
+#   - Leaves systemd unit files and the rest of /etc alone.
+
 set -Eeuo pipefail
 
-SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-cd "$SCRIPT_DIR"
-
 PROG_PIN="/sys/fs/bpf/cve_2026_98432_guard"
+
 MAPS=(
     /sys/fs/bpf/cve_2026_98432_stats
     /sys/fs/bpf/cve_2026_98432_whitelist
@@ -18,97 +24,218 @@ MAPS=(
     /sys/fs/bpf/cve_2026_98432_drop_ips
     /sys/fs/bpf/cve_2026_98432_events
     /sys/fs/bpf/cve_2026_98432_config
+    /sys/fs/bpf/cve_2026_98432_meta
 )
+
+# bpftool truncates the original program name to this kernel-visible name.
+PROG_NAME="xdp_cve_2026_98"
+
 PID_FILE="/run/mtcp-guardd.pid"
+ETC_DIR="/etc/cve-2026-98432-guard"
 
-fail() {
-    printf '[ERROR] %s\n' "$*" >&2
-    exit 1
-}
+info() { printf '[INFO]  %s\n' "$*"; }
+warn() { printf '[WARN]  %s\n' "$*" >&2; }
+fail() { printf '[ERROR] %s\n' "$*" >&2; exit 1; }
 
-info()  { printf '[INFO]  %s\n' "$*"; }
-warn()  { printf '[WARN]  %s\n' "$*"; }
+[[ $EUID -eq 0 ]] || fail "Run this script as root."
+
+command -v bpftool >/dev/null 2>&1 || fail "bpftool is required."
+command -v ip >/dev/null 2>&1 || fail "iproute2 is required."
+
+[[ -e "$PROG_PIN" ]] ||
+    fail "Guard program pin not found at $PROG_PIN."
 
 # ---------------------------------------------------------------------------
-# 1. Stop mtcp-guardd.service (so it stops consuming perf events)
+# 1. Identify the exact guard program.
+#
+# Do not rely on a 'pinned' annotation: this bpftool version does not
+# display pin paths in 'bpftool prog show'.
+#
+# Instead, identify the unique XDP program using its kernel-visible name.
 # ---------------------------------------------------------------------------
+
+info "Identifying guard program by XDP program name..."
+
+PROG_IDS="$(
+    bpftool prog show |
+    awk -v name="$PROG_NAME" '
+        $1 ~ /^[0-9]+:$/ && $2 == "xdp" && $3 == "name" && $4 == name {
+            id = $1
+            sub(/:$/, "", id)
+            print id
+        }
+    '
+)"
+
+MATCH_COUNT="$(printf '%s\n' "$PROG_IDS" | grep -Ec '^[0-9]+$' || true)"
+
+[[ "$MATCH_COUNT" -eq 1 ]] ||
+    fail "Expected exactly one XDP program named $PROG_NAME; found $MATCH_COUNT. Nothing was detached or unpinned."
+
+PROG_ID="$PROG_IDS"
+
+info "Guard program ID: $PROG_ID"
+
+# ---------------------------------------------------------------------------
+# 2. Stop the daemon.
+# ---------------------------------------------------------------------------
+
 if command -v systemctl >/dev/null 2>&1; then
     info "Stopping mtcp-guardd.service..."
     systemctl stop mtcp-guardd.service 2>/dev/null || true
-else
-    warn "systemctl not found; skipping daemon stop"
+fi
+
+if command -v pgrep >/dev/null 2>&1 &&
+   pgrep -x mtcp-guardd >/dev/null 2>&1; then
+
+    info "Stopping remaining mtcp-guardd processes..."
+    pkill -TERM -x mtcp-guardd 2>/dev/null || true
+
+    for _ in {1..20}; do
+        pgrep -x mtcp-guardd >/dev/null 2>&1 || break
+        sleep 0.1
+    done
+
+    if pgrep -x mtcp-guardd >/dev/null 2>&1; then
+        warn "Daemon did not exit after SIGTERM; sending SIGKILL."
+        pkill -KILL -x mtcp-guardd 2>/dev/null || true
+    fi
 fi
 
 # ---------------------------------------------------------------------------
-# 2. Detach XDP from all network interfaces matching our program ID
+# 3. Detach only interfaces carrying this exact program ID.
 # ---------------------------------------------------------------------------
-info "Detaching XDP from network interfaces..."
 
-if command -v ip >/dev/null 2>&1 && command -v bpftool >/dev/null 2>&1; then
-    if [[ -e "$PROG_PIN" ]]; then
-        PROG_ID="$(bpftool prog show pinned "$PROG_PIN" 2>/dev/null || true)"
-        PROG_ID="${PROG_ID%%:*}"
-    else
-        PROG_ID=""
+info "Searching network interfaces for guard attachments..."
+
+DETACHED=0
+
+for path in /sys/class/net/*; do
+    [[ -e "$path" ]] || continue
+
+    IFACE="${path##*/}"
+
+    CURRENT="$(bpftool net show dev "$IFACE" 2>/dev/null || true)"
+
+    [[ -n "$CURRENT" ]] || continue
+
+    while IFS= read -r ATTACHMENT; do
+        [[ -n "$ATTACHMENT" ]] || continue
+
+        MODE="${ATTACHMENT%% id *}"
+        ATTACHED_ID="${ATTACHMENT##* id }"
+
+        [[ "$ATTACHED_ID" =~ ^[0-9]+$ ]] || continue
+        [[ "$ATTACHED_ID" == "$PROG_ID" ]] || continue
+
+        case "$MODE" in
+            generic)
+                IP_MODE="xdpgeneric"
+                ;;
+            xdpdrv)
+                IP_MODE="xdpdrv"
+                ;;
+            xdpoffload)
+                IP_MODE="xdpoffload"
+                ;;
+            *)
+                fail "Unknown XDP mode '$MODE' on $IFACE. Pins retained."
+                ;;
+        esac
+
+        info "Detaching guard from $IFACE ($MODE, program $PROG_ID)..."
+
+        if ! ip link set dev "$IFACE" "$IP_MODE" off; then
+            fail "Could not detach guard from $IFACE ($IP_MODE). Pins retained."
+        fi
+
+        # Confirm that this exact program is no longer attached.
+        AFTER="$(bpftool net show dev "$IFACE" 2>/dev/null || true)"
+
+        if grep -Eq \
+            "(generic|xdpdrv|xdpoffload) id ${PROG_ID}([[:space:]]|$)" \
+            <<< "$AFTER"; then
+            fail "Guard program $PROG_ID remains attached to $IFACE. Pins retained."
+        fi
+
+        info "Detached from $IFACE."
+        DETACHED=$((DETACHED + 1))
+
+    done < <(
+        grep -Eo '(generic|xdpdrv|xdpoffload) id [0-9]+' <<< "$CURRENT" || true
+    )
+done
+
+info "Guard attachments detached: $DETACHED"
+
+# ---------------------------------------------------------------------------
+# 4. Verify no remaining attachment carries the guard program ID.
+# ---------------------------------------------------------------------------
+
+info "Checking for remaining guard attachments..."
+
+for path in /sys/class/net/*; do
+    [[ -e "$path" ]] || continue
+
+    IFACE="${path##*/}"
+    CURRENT="$(bpftool net show dev "$IFACE" 2>/dev/null || true)"
+
+    if grep -Eq \
+        "(generic|xdpdrv|xdpoffload) id ${PROG_ID}([[:space:]]|$)" \
+        <<< "$CURRENT"; then
+        fail "Guard program $PROG_ID remains attached to $IFACE. Pins retained."
     fi
-
-    if [[ -n "$PROG_ID" && "$PROG_ID" =~ ^[0-9]+$ ]]; then
-        for path in /sys/class/net/*; do
-            [[ -e "$path" ]] || continue
-            IFACE="${path##*/}"
-            [[ "$IFACE" == "lo" ]] && continue
-
-            CURRENT="$(bpftool net show dev "$IFACE" 2>/dev/null || true)"
-            IDS="$(grep -Eo '(generic|xdpdrv|xdpoffload) id [0-9]+' <<< "$CURRENT" || true)"
-
-            if [[ -n "$IDS" ]]; then
-                while IFS= read -r ATTACHMENT; do
-                    [[ -n "$ATTACHMENT" ]] || continue
-                    CURRENT_ID="${ATTACHMENT##*id }"
-                    if [[ "$CURRENT_ID" == "$PROG_ID" ]]; then
-                        if ip link set dev "$IFACE" xdp off 2>/dev/null; then
-                            info "XDP detached from $IFACE"
-                        else
-                            warn "Could not detach XDP from $IFACE"
-                        fi
-                    fi
-                done <<< "$IDS"
-            fi
-        done
-    else
-        warn "Could not determine program ID; skipping XDP detachment"
-    fi
-else
-    warn "ip or bpftool not found; skipping XDP detachment"
-fi
+done
 
 # ---------------------------------------------------------------------------
-# 3. Remove pinned BPF program and maps
+# 5. Remove pinned BPF objects.
 # ---------------------------------------------------------------------------
+
 info "Removing pinned BPF objects..."
 
 if [[ -e "$PROG_PIN" ]]; then
     rm -f -- "$PROG_PIN"
-    info "Removed pinned program: $PROG_PIN"
+    info "Removed program pin: $PROG_PIN"
 fi
 
 for map in "${MAPS[@]}"; do
     if [[ -e "$map" ]]; then
         rm -f -- "$map"
-        info "Removed pinned map: $map"
+        info "Removed map pin: $map"
     fi
 done
 
 # ---------------------------------------------------------------------------
-# 4. Remove PID file
+# 6. Remove daemon PID file.
 # ---------------------------------------------------------------------------
+
 if [[ -e "$PID_FILE" ]]; then
     rm -f -- "$PID_FILE"
-    info "Removed: $PID_FILE"
+    info "Removed PID file: $PID_FILE"
+fi
+
+# ---------------------------------------------------------------------------
+# 7. Remove deployed kernel-specific object files.
+# ---------------------------------------------------------------------------
+
+info "Removing deployed kernel-specific objects from $ETC_DIR..."
+
+if [[ -d "$ETC_DIR" ]]; then
+    if [[ -e "$ETC_DIR/cve_2026_98432_guard.o" ]]; then
+        rm -f -- "$ETC_DIR/cve_2026_98432_guard.o"
+        info "Removed legacy object."
+    fi
+
+    shopt -s nullglob
+
+    for obj in "$ETC_DIR"/cve_2026_98432_guard-k*.o; do
+        rm -f -- "$obj"
+        info "Removed: $obj"
+    done
+
+    shopt -u nullglob
 fi
 
 echo
-info "Removal complete. The cve_2026_98432 XDP BPF filter has been removed."
-info "Note: systemd service files and /etc/cve-2026_98432_guard/ are kept."
-info "      Pinned BPF objects exist only for the lifetime of the running kernel."
-info "      A reboot will also clear any remaining BPF state."
+info "Removal complete."
+info "Systemd unit files and remaining $ETC_DIR contents were kept."

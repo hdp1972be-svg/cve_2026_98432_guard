@@ -33,6 +33,8 @@ err()   { printf '%b[ERROR]%b %s\n' "$C_RED" "$C_RESET" "$*" >&2; }
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
+SRC_DIR="$SCRIPT_DIR/src"
+
 CLANG="${CLANG:-clang}"
 CC="${CC:-gcc}"
 
@@ -51,16 +53,21 @@ DESCRIPTION
     Compiles the eBPF XDP guard and (when libbpf is available) the
     userspace daemon and control utility.
 
-    By default the script auto-detects the running kernel version and
-    picks the correct map ABI and bpf_perf_event_output helper ID for
-    it. All of that can be overridden with the options below, which is
-    useful when cross-building for a different target kernel.
+    Source files are read from ./src/. Build artifacts are written to
+    the top-level directory (next to this script).
+
+    The eBPF object is named after the target kernel:
+        cve_2026_98432_guard-k<major>.<minor>.o
+    so multi-kernel systems keep one .o per kernel in the same tree
+    without clobbering each other. The daemon, ctl and probe are
+    kernel-independent and keep their plain names.
 
 OPTIONS
     --kernel X.Y
         Target kernel version, e.g. 4.18, 5.10, 6.6.
         Default: auto-detect from the running kernel via uname -r.
-        Affects both map ABI and perf helper ID selection.
+        Affects both map ABI and perf helper ID selection, and the
+        name of the produced .o file.
 
     --legacy-maps
         Force legacy struct bpf_map_def map ABI (required on kernels
@@ -78,6 +85,10 @@ OPTIONS
     --no-userspace
         Skip building mtcp-guardd and mtcp-guard-ctl even if libbpf
         is installed. Useful for eBPF-only CI builds.
+
+    --no-pcap
+        Do not build pcap capture into the daemon even if libpcap is
+        available. Useful for a minimal daemon binary.
 
     -h, --help
         Show this help text and exit.
@@ -98,19 +109,25 @@ EXIT CODES
 
 EXAMPLES
     ./build.sh
-        Auto-detect the running kernel and build everything.
+        Build for the running kernel. Produces
+        cve_2026_98432_guard-k<major>.<minor>.o.
 
     ./build.sh --kernel 5.10
         Cross-build for kernel 5.10 (BTF maps, perf helper 25).
+        Produces cve_2026_98432_guard-k5.10.o.
 
     ./build.sh --kernel 4.19 --legacy-maps
         Cross-build for 4.19, forcing the legacy map ABI.
+        Produces cve_2026_98432_guard-k4.19.o.
 
     ./build.sh --btf-maps --perf-helper-id 25
         Force BTF maps and helper ID 25 on top of auto-detected kernel.
 
     ./build.sh --no-userspace
         Build only the eBPF object and packet probe.
+
+    ./build.sh --no-pcap
+        Build userspace tools without pcap capture support.
 
     ./build.sh --help
         Show this help.
@@ -124,6 +141,7 @@ KERNEL_ARG=""
 MAPS_MODE="auto"           # auto | legacy | btf
 PERF_HELPER_ARG=""
 BUILD_USERSPACE=1
+BUILD_PCAP=1
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -157,6 +175,10 @@ while [[ $# -gt 0 ]]; do
             BUILD_USERSPACE=0
             shift
             ;;
+        --no-pcap)
+            BUILD_PCAP=0
+            shift
+            ;;
         -h|--help)
             usage
             exit 0
@@ -183,20 +205,18 @@ version_at_least() {
 
 echo "=== cve_2026_98432 XDP build ==="
 info "Source directory: $SCRIPT_DIR"
+info "C sources:        $SRC_DIR"
 echo
 
 if [[ -n "$KERNEL_ARG" ]]; then
-    # ── Explicit target supplied by the user ────────────────────────────
     TARGET_KERNEL="$KERNEL_ARG"
     KERNEL_SOURCE="CLI (--kernel)"
     info "Kernel detection: SKIPPED (explicit --kernel provided)"
     info "Target kernel:    $TARGET_KERNEL (from $KERNEL_SOURCE)"
 else
-    # ── Auto-detect the running kernel ──────────────────────────────────
     info "Kernel detection: no --kernel given, auto-detecting running kernel..."
     echo
 
-    # Step 1: uname -r
     if command -v uname >/dev/null 2>&1; then
         DETECTED_REL="$(uname -r 2>/dev/null || true)"
         if [[ -n "$DETECTED_REL" ]]; then
@@ -214,7 +234,6 @@ else
         DETECTED_REL=""
     fi
 
-    # Step 2: /proc fallback
     if [[ -z "$DETECTED_REL" ]] && [[ -r /proc/sys/kernel/osrelease ]]; then
         DETECTED_REL="$(< /proc/sys/kernel/osrelease)"
         printf '  %b·%b /proc/sys/kernel/osrelease -> %s\n' \
@@ -222,7 +241,6 @@ else
         DETECTED_VIA="/proc/sys/kernel/osrelease"
     fi
 
-    # Step 3: getconf fallback (rarely needed, harmless)
     if [[ -z "$DETECTED_REL" ]] && command -v getconf >/dev/null 2>&1; then
         DETECTED_REL="$(getconf GNU_LINUX_VERSION 2>/dev/null || true)"
         if [[ -n "$DETECTED_REL" ]]; then
@@ -243,7 +261,6 @@ else
     info "Target kernel:    $TARGET_KERNEL (from $KERNEL_SOURCE)"
 fi
 
-# Parse major.minor from whatever string we ended up with
 KERNEL_MM="$(printf '%s\n' "$TARGET_KERNEL" \
     | sed -nE 's/^([0-9]+)\.([0-9]+).*/\1 \2/p')"
 if [[ -z "$KERNEL_MM" ]]; then
@@ -302,21 +319,11 @@ fi
 
 # ---------------------------------------------------------------------------
 # Print resolved configuration summary
-#
-# Layout invariants:
-#   - LABEL_W must be >= the longest label INCLUDING the header title.
-#     "Resolved build configuration" is 29 chars, so LABEL_W=30 guarantees
-#     it fits with one space to spare.
-#   - render_row() truncates overlong content so no future value can
-#     silently overrun the field and break the box.
-#   - Every rendered row has exactly LABEL_W + 1 + VALUE_W + 2 characters
-#     between the outer '│' wrappers. The border is generated from that
-#     same INNER_W, so rows and borders always match.
 # ---------------------------------------------------------------------------
 MAP_ABI_STR="legacy (struct bpf_map_def)"
 [[ "$LEGACY_MAPS" -eq 0 ]] && MAP_ABI_STR="BTF-style"
 
-LABEL_W=30      # must be >= len("Resolved build configuration") = 29
+LABEL_W=30
 VALUE_W=40
 
 render_row() {
@@ -351,15 +358,36 @@ echo "  └${BORDER}┘"
 echo
 
 # ---------------------------------------------------------------------------
-GUARD_SRC="cve_2026_98432_guard.c"
-GUARD_OBJ="cve_2026_98432_guard.o"
-PROBE_SRC="xdp_option_probe.c"
-PROBE_BIN="xdp_option_probe"
-DAEMON_SRC="mtcp-guardd.c"
-DAEMON_BIN="mtcp-guardd"
-CTL_SRC="mtcp-guard-ctl.c"
-CTL_BIN="mtcp-guard-ctl"
-CHECK_SCRIPT="check-bpf-support"
+# Source paths (all .c files under ./src)
+# ---------------------------------------------------------------------------
+GUARD_SRC="$SRC_DIR/cve_2026_98432_guard.c"
+PROBE_SRC="$SRC_DIR/xdp_option_probe.c"
+DAEMON_SRC="$SRC_DIR/mtcp-guardd.c"
+DAEMON_PCAP_SRC="$SRC_DIR/pcap_writer.c"
+DAEMON_PCAP_HDR="$SRC_DIR/pcap_writer.h"
+CTL_SRC="$SRC_DIR/mtcp-guard-ctl.c"
+
+# ---------------------------------------------------------------------------
+# Artifact paths.
+#
+# The eBPF object is kernel-version-specific: its map ABI and perf
+# helper ID are baked in at compile time, so one .o cannot serve two
+# different kernels. Naming it after the target kernel lets multi-boot
+# systems keep both:
+#
+#   cve_2026_98432_guard-k4.18.o   (legacy maps, helper 26)
+#   cve_2026_98432_guard-k5.10.o   (BTF maps, helper 25)
+#   cve_2026_98432_guard-k6.6.o    (BTF maps, helper 25)
+#
+# The userspace binaries are kernel-independent and keep their plain
+# names.
+# ---------------------------------------------------------------------------
+GUARD_OBJ="$SCRIPT_DIR/cve_2026_98432_guard-k${KERNEL_MAJOR}.${KERNEL_MINOR}.o"
+PROBE_BIN="$SCRIPT_DIR/xdp_option_probe"
+DAEMON_BIN="$SCRIPT_DIR/mtcp-guardd"
+CTL_BIN="$SCRIPT_DIR/mtcp-guard-ctl"
+
+CHECK_SCRIPT="$SCRIPT_DIR/check-bpf-support"
 
 TMP_GUARD=""
 TMP_PROBE=""
@@ -367,10 +395,10 @@ TMP_DAEMON=""
 TMP_CTL=""
 
 cleanup() {
-    [[ -z "$TMP_GUARD" ]] || rm -f -- "$TMP_GUARD"
-    [[ -z "$TMP_PROBE" ]] || rm -f -- "$TMP_PROBE"
+    [[ -z "$TMP_GUARD" ]]  || rm -f -- "$TMP_GUARD"
+    [[ -z "$TMP_PROBE" ]]  || rm -f -- "$TMP_PROBE"
     [[ -z "$TMP_DAEMON" ]] || rm -f -- "$TMP_DAEMON"
-    [[ -z "$TMP_CTL" ]] || rm -f -- "$TMP_CTL"
+    [[ -z "$TMP_CTL" ]]    || rm -f -- "$TMP_CTL"
 }
 trap cleanup EXIT
 
@@ -380,12 +408,19 @@ fail() {
 }
 
 # ---------------------------------------------------------------------------
+# 0. Verify the source tree layout
+# ---------------------------------------------------------------------------
+if [[ ! -d "$SRC_DIR" ]]; then
+    fail "Source directory not found: $SRC_DIR"
+fi
+
+# ---------------------------------------------------------------------------
 # 1. Check kernel capabilities
 # ---------------------------------------------------------------------------
 [[ -f "$CHECK_SCRIPT" ]] || fail "Missing $CHECK_SCRIPT"
 
 echo "[1/4] Checking kernel BPF/XDP support..."
-CHECK_OUTPUT="$(bash "./$CHECK_SCRIPT" 2>&1)" || {
+CHECK_OUTPUT="$(bash "$CHECK_SCRIPT" 2>&1)" || {
     printf '%s\n' "$CHECK_OUTPUT"
     fail "BPF capability check failed"
 }
@@ -410,6 +445,7 @@ ok "Clang found: $("$CLANG" --version | head -n 1)"
 ok "GCC found: $("$CC" --version | head -n 1)"
 info "BPF target support will be tested during compilation."
 
+# --- libbpf (required for userspace tools) ---
 if [[ "$BUILD_USERSPACE" -eq 0 ]]; then
     warn "Userspace tools disabled via --no-userspace"
     HAVE_LIBBPF=0
@@ -424,6 +460,43 @@ else
     HAVE_LIBBPF=0
 fi
 
+# --- libpcap (optional, enables -p in the daemon) ---
+HAVE_PCAP=0
+DAEMON_PCAP_LIBS=""
+DAEMON_PCAP_DEFS=""
+DAEMON_PCAP_SRCS=""
+
+if [[ "$HAVE_LIBBPF" -eq 1 ]] && [[ "$BUILD_PCAP" -eq 1 ]]; then
+    if command -v pkg-config >/dev/null 2>&1 && pkg-config --exists libpcap 2>/dev/null; then
+        if [[ -r "$DAEMON_PCAP_SRC" ]] && [[ -r "$DAEMON_PCAP_HDR" ]]; then
+            ok "libpcap found (daemon -p capture will be available)"
+            HAVE_PCAP=1
+            DAEMON_PCAP_LIBS="-lpcap"
+            DAEMON_PCAP_DEFS="-DHAVE_PCAP"
+            DAEMON_PCAP_SRCS="$DAEMON_PCAP_SRC"
+        else
+            warn "libpcap found but $DAEMON_PCAP_SRC/$DAEMON_PCAP_HDR missing; -p disabled"
+        fi
+    else
+        warn "libpcap not found; daemon will be built WITHOUT pcap capture (-p disabled)"
+        warn "  install libpcap-dev / libpcap-devel to enable -p"
+    fi
+elif [[ "$HAVE_LIBBPF" -eq 1 ]] && [[ "$BUILD_PCAP" -eq 0 ]]; then
+    warn "pcap capture disabled via --no-pcap"
+fi
+
+# --- libsystemd (optional, direct journald logging) ---
+DAEMON_SYSTEMD_LIBS=""
+if [[ "$HAVE_LIBBPF" -eq 1 ]]; then
+    if command -v pkg-config >/dev/null 2>&1 && pkg-config --exists libsystemd 2>/dev/null; then
+        ok "libsystemd found (daemon logs directly to journald)"
+        DAEMON_SYSTEMD_LIBS="-lsystemd"
+    else
+        warn "libsystemd not found; daemon will use syslog() fallback"
+        warn "  install libsystemd-dev / systemd-devel for direct journald"
+    fi
+fi
+
 # ---------------------------------------------------------------------------
 # 3. Check source files
 # ---------------------------------------------------------------------------
@@ -433,7 +506,11 @@ echo "[3/4] Checking source files..."
 [[ -r "$PROBE_SRC" ]] || fail "Missing $PROBE_SRC"
 if [[ "$HAVE_LIBBPF" -eq 1 ]]; then
     [[ -r "$DAEMON_SRC" ]] || fail "Missing $DAEMON_SRC"
-    [[ -r "$CTL_SRC" ]] || fail "Missing $CTL_SRC"
+    [[ -r "$CTL_SRC" ]]    || fail "Missing $CTL_SRC"
+    if [[ "$HAVE_PCAP" -eq 1 ]]; then
+        [[ -r "$DAEMON_PCAP_SRC" ]] || fail "Missing $DAEMON_PCAP_SRC"
+        [[ -r "$DAEMON_PCAP_HDR" ]] || fail "Missing $DAEMON_PCAP_HDR"
+    fi
 fi
 
 TMP_GUARD="$(mktemp "$SCRIPT_DIR/.guard.XXXXXX")"
@@ -470,9 +547,18 @@ if [[ "$HAVE_LIBBPF" -eq 1 ]]; then
     TMP_DAEMON="$(mktemp "$SCRIPT_DIR/.daemon.XXXXXX")"
     TMP_CTL="$(mktemp "$SCRIPT_DIR/.ctl.XXXXXX")"
 
-    "$CC" -O2 -Wall -Wextra \
-        -o "$TMP_DAEMON" "$DAEMON_SRC" -lbpf -lelf -lsystemd
-    ok "Daemon compiled: $DAEMON_BIN"
+    # -I$SRC_DIR so pcap_writer.h is found when compiling mtcp-guardd.c
+    # shellcheck disable=SC2086
+    "$CC" -O2 -Wall -Wextra -I"$SRC_DIR" \
+        $DAEMON_PCAP_DEFS \
+        -o "$TMP_DAEMON" \
+        "$DAEMON_SRC" $DAEMON_PCAP_SRCS \
+        -lbpf -lelf $DAEMON_PCAP_LIBS $DAEMON_SYSTEMD_LIBS
+    if [[ "$HAVE_PCAP" -eq 1 ]]; then
+        ok "Daemon compiled: $DAEMON_BIN (with pcap capture)"
+    else
+        ok "Daemon compiled: $DAEMON_BIN (no pcap capture)"
+    fi
 
     "$CC" -O2 -Wall -Wextra \
         -o "$TMP_CTL" "$CTL_SRC" -lbpf -lelf
@@ -499,6 +585,6 @@ ok "BUILD SUCCESSFUL"
 info "eBPF object:    $GUARD_OBJ"
 info "Probe binary:   $PROBE_BIN"
 if [[ "$HAVE_LIBBPF" -eq 1 ]]; then
-    info "Daemon binary:  $DAEMON_BIN"
+    info "Daemon binary:  $DAEMON_BIN$([[ "$HAVE_PCAP" -eq 1 ]] && echo ' (with pcap)' || echo ' (no pcap)')"
     info "Config utility: $CTL_BIN"
 fi

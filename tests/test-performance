@@ -1,0 +1,419 @@
+#!/usr/bin/env bash
+# ============================================================================
+# test3 — performance comparison: iperf3 with and without the XDP guard.
+#
+# Usage:
+#   sudo ./test3                      # test lo against a local iperf3 server
+#   sudo ./test3 -i veth0             # test veth0 against a local server
+#   sudo ./test3 -i enp2s0            # test enp2s0 against a public iperf3 server
+#   sudo ./test3 --both               # test lo AND veth0 against local servers
+#
+# Options:
+#   -i, --iface <iface>   Interface to test (default: lo)
+#   --both                Test both lo and veth0 (local servers only)
+#   --server <host>       Override the iperf3 server host
+#   --port <port>         Override the iperf3 server port (default: 5201)
+#   --duration <secs>     Test duration per run (default: 30)
+#   --streams <n>         Parallel streams (default: 4)
+#   --runs <n>            Runs per configuration (default: 3)
+#
+# Statistics are computed with 3 digits after the decimal point.
+# When a non-loopback interface is given, the script uses a public iperf3
+# server from the iperf.fr / public-iperf3-servers list. Public servers
+# allow only one connection at a time; the script retries on "server busy".
+# ============================================================================
+
+set -uo pipefail
+
+if [[ -t 1 ]]; then
+    R='\033[0;31m'; G='\033[0;32m'; Y='\033[0;33m'
+    B='\033[0;34m'; C='\033[0;36m'; BOLD='\033[1m'; N='\033[0m'
+else
+    R=''; G=''; Y=''; B=''; C=''; BOLD=''; N=''
+fi
+
+HDR()  { printf "\n${BOLD}${B}══════════════════════════════════════════════════════════════${N}\n";
+         printf "${BOLD}${B}  %s${N}\n" "$*";
+         printf "${BOLD}${B}══════════════════════════════════════════════════════════════${N}\n"; }
+STEP() { printf "\n${BOLD}${C}── %s ──${N}\n" "$*"; }
+OK()   { printf "${G}  [OK]${N}   %s\n" "$*"; }
+FAIL() { printf "${R}  [FAIL]${N} %s\n" "$*"; FAILED=$((FAILED+1)); }
+INFO() { printf "${Y}  [INFO]${N} %s\n" "$*"; }
+RAW()  { printf "${C}  │ ${N}"; sed 's/^/  │ /'; }
+
+FAILED=0
+PASSED=0
+
+# ── defaults ──────────────────────────────────────────────────────────────
+TEST_IFACE="lo"
+TEST_BOTH=0
+IPERF_SERVER=""
+IPERF_PORT="5201"
+IPERF_DURATION="30"
+IPERF_STREAMS="4"
+RUNS="3"
+PROG_PIN="/sys/fs/bpf/cve_2026_98432_guard"
+
+DEFAULT_PUBLIC_SERVER="iperf-ams-nl.eranium.net"
+DEFAULT_PUBLIC_PORT="5201"
+
+# ── arg parsing ───────────────────────────────────────────────────────────
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -i|--iface)
+            [[ $# -ge 2 ]] || { echo "error: $1 requires a value" >&2; exit 2; }
+            TEST_IFACE="$2"; shift 2 ;;
+        --both)
+            TEST_BOTH=1; shift ;;
+        --server)
+            [[ $# -ge 2 ]] || { echo "error: $1 requires a value" >&2; exit 2; }
+            IPERF_SERVER="$2"; shift 2 ;;
+        --port)
+            [[ $# -ge 2 ]] || { echo "error: $1 requires a value" >&2; exit 2; }
+            IPERF_PORT="$2"; shift 2 ;;
+        --duration)
+            [[ $# -ge 2 ]] || { echo "error: $1 requires a value" >&2; exit 2; }
+            IPERF_DURATION="$2"; shift 2 ;;
+        --streams)
+            [[ $# -ge 2 ]] || { echo "error: $1 requires a value" >&2; exit 2; }
+            IPERF_STREAMS="$2"; shift 2 ;;
+        --runs)
+            [[ $# -ge 2 ]] || { echo "error: $1 requires a value" >&2; exit 2; }
+            RUNS="$2"; shift 2 ;;
+        -h|--help)
+            sed -n '3,20p' "$0" | sed 's/^# //;s/^#//'
+            exit 0 ;;
+        *)
+            echo "error: unknown argument: $1" >&2
+            echo "usage: $0 [-i <iface>] [--both] [--server <host>] [--port <port>]" >&2
+            exit 2 ;;
+    esac
+done
+
+# ── decide local vs public server ─────────────────────────────────────────
+if [[ "$TEST_IFACE" == "lo" ]] || [[ "$TEST_IFACE" == "veth0" ]] || [[ "$TEST_IFACE" == "veth1" ]]; then
+    IPERF_SERVER="${IPERF_SERVER:-127.0.0.1}"
+    IPERF_MODE="local"
+else
+    IPERF_SERVER="${IPERF_SERVER:-$DEFAULT_PUBLIC_SERVER}"
+    IPERF_PORT="${IPERF_PORT:-$DEFAULT_PUBLIC_PORT}"
+    IPERF_MODE="public"
+fi
+
+# ── helpers ───────────────────────────────────────────────────────────────
+iperf_throughput() {
+    local json_file="$1"
+    if command -v jq >/dev/null 2>&1; then
+        jq -r '.end.sum_sent.bits_per_second / 1000000' "$json_file" 2>/dev/null || echo 0
+    else
+        awk '/sender/ { for (i=1;i<=NF;i++) if ($i=="Mbits/sec") { print $(i-1); exit } }' "$json_file" 2>/dev/null || echo 0
+    fi
+}
+
+# Format a float with 3 digits after the comma.
+fmt3() {
+    local v="$1"
+    if [[ -z "$v" ]]; then v=0; fi
+    awk -v x="$v" 'BEGIN{ printf "%.3f", x }'
+}
+
+# Median of a list of floats on stdin. Prints with 3 digits.
+# For odd n: middle element. For even n: average of two middle elements.
+median3() {
+    local arr
+    mapfile -t arr < <(sort -n)
+    local n=${#arr[@]}
+    (( n == 0 )) && { echo "0.000"; return; }
+    if (( n % 2 == 1 )); then
+        awk -v v="${arr[$((n/2))]}" 'BEGIN{ printf "%.3f", v }'
+    else
+        awk -v a="${arr[$((n/2-1))]}" -v b="${arr[$((n/2))]}" \
+            'BEGIN{ printf "%.3f", (a+b)/2.0 }'
+    fi
+}
+
+# Sample standard deviation of a list of floats on stdin.
+# Uses n-1 in the denominator (Bessel's correction).
+# Prints with 3 digits. For n < 2, prints 0.000.
+stdev3() {
+    local arr
+    mapfile -t arr < <(sort -n)
+    local n=${#arr[@]}
+    (( n < 2 )) && { echo "0.000"; return; }
+    awk -v values="${arr[*]}" '
+        BEGIN {
+            n = split(values, v, " ")
+            sum = 0
+            for (i = 1; i <= n; i++) sum += v[i]
+            mean = sum / n
+            ss = 0
+            for (i = 1; i <= n; i++) ss += (v[i] - mean) * (v[i] - mean)
+            sd = sqrt(ss / (n - 1))
+            printf "%.3f", sd
+        }'
+}
+
+# Percent change vs baseline, with sign, 3 digits.
+pct3() {
+    local base="$1" val="$2"
+    awk -v b="$base" -v x="$val" 'BEGIN{
+        if (b == 0) { print "n/a"; exit }
+        printf "%+.3f%%", (x-b)/b*100
+    }'
+}
+
+# Coefficient of variation as percent, 3 digits. Empty if mean == 0.
+cv3() {
+    local mean="$1" sd="$2"
+    awk -v m="$mean" -v s="$sd" 'BEGIN{
+        if (m == 0) { print "n/a"; exit }
+        printf "%.3f%%", s/m*100
+    }'
+}
+
+detach_xdp() {
+    local iface="$1"
+    sudo bpftool net detach xdpgeneric dev "$iface" 2>/dev/null || true
+    sudo bpftool net detach xdpdrv dev "$iface" 2>/dev/null || true
+    sudo bpftool net detach xdp dev "$iface" 2>/dev/null || true
+    sudo ip link set dev "$iface" xdp off 2>/dev/null || true
+}
+
+attach_xdp() {
+    local iface="$1" mode="$2"
+    sudo ip link set dev "$iface" "$mode" pinned "$PROG_PIN" 2>/dev/null
+}
+
+run_iperf_once() {
+    local label="$1"
+    local outfile="/tmp/iperf3-${label}-$$.json"
+    local textfile="/tmp/iperf3-${label}-$$.txt"
+    local attempt rc mbps
+
+    for attempt in 1 2 3; do
+        if [[ "$IPERF_MODE" == "local" ]]; then
+            sudo pkill -f "iperf3 -s -p $IPERF_PORT" 2>/dev/null || true
+            iperf3 -s -p "$IPERF_PORT" -1 >/dev/null 2>&1 &
+            local srv_pid=$!
+            sleep 0.3
+        fi
+
+        iperf3 -c "$IPERF_SERVER" -p "$IPERF_PORT" \
+            -t "$IPERF_DURATION" -P "$IPERF_STREAMS" \
+            --json > "$outfile" 2>"$textfile"
+        rc=$?
+
+        if [[ "$IPERF_MODE" == "local" ]]; then
+            wait "$srv_pid" 2>/dev/null || true
+        fi
+
+        if (( rc == 0 )); then
+            mbps=$(iperf_throughput "$outfile")
+            echo "$mbps"
+            rm -f "$outfile" "$textfile"
+            return 0
+        fi
+
+        if grep -qi "busy" "$textfile" 2>/dev/null; then
+            INFO "server busy, retrying in 5s (attempt $attempt/3)"
+            sleep 5
+            continue
+        fi
+        break
+    done
+
+    echo 0
+    rm -f "$outfile" "$textfile"
+    return 1
+}
+
+# ── core test for one interface ───────────────────────────────────────────
+run_test_for_iface() {
+    local iface="$1"
+    local prefix="$2"
+
+    HDR "Testing $iface"
+
+    STEP "Check interface exists"
+    if ip link show "$iface" >/dev/null 2>&1; then
+        OK "interface exists: $iface"
+        PASSED=$((PASSED+1))
+    else
+        FAIL "interface not found: $iface"
+        return 1
+    fi
+
+    # ── baseline ──────────────────────────────────────────────────────
+    HDR "Baseline (no XDP on $iface)"
+    detach_xdp "$iface"
+    sleep 0.5
+    if sudo bpftool net show dev "$iface" 2>/dev/null | grep -q " id "; then
+        FAIL "XDP still attached to $iface"
+        return 1
+    fi
+    OK "no XDP program on $iface"
+    PASSED=$((PASSED+1))
+
+    local baseline_runs=()
+    local i mbps
+    for i in $(seq 1 "$RUNS"); do
+        STEP "Baseline run $i/$RUNS"
+        mbps=$(run_iperf_once "${prefix}-baseline-${i}")
+        INFO "throughput: $(fmt3 "$mbps") Mbits/sec"
+        baseline_runs+=("$mbps")
+    done
+    local baseline_median baseline_sd
+    baseline_median=$(printf '%s\n' "${baseline_runs[@]}" | median3)
+    baseline_sd=$(printf '%s\n' "${baseline_runs[@]}" | stdev3)
+    OK "baseline median: $(fmt3 "$baseline_median") Mbits/sec (sd=$(fmt3 "$baseline_sd"), cv=$(cv3 "$baseline_median" "$baseline_sd"))"
+    PASSED=$((PASSED+1))
+
+    # ── xdpgeneric ────────────────────────────────────────────────────
+    HDR "Guard in xdpgeneric on $iface"
+    local generic_median="0.000"
+    local generic_sd="0.000"
+    if attach_xdp "$iface" "xdpgeneric"; then
+        OK "attached (xdpgeneric)"
+        PASSED=$((PASSED+1))
+        sudo bpftool net show dev "$iface" | RAW
+
+        local generic_runs=()
+        for i in $(seq 1 "$RUNS"); do
+            STEP "xdpgeneric run $i/$RUNS"
+            mbps=$(run_iperf_once "${prefix}-generic-${i}")
+            INFO "throughput: $(fmt3 "$mbps") Mbits/sec"
+            generic_runs+=("$mbps")
+        done
+        generic_median=$(printf '%s\n' "${generic_runs[@]}" | median3)
+        generic_sd=$(printf '%s\n' "${generic_runs[@]}" | stdev3)
+        OK "xdpgeneric median: $(fmt3 "$generic_median") Mbits/sec (sd=$(fmt3 "$generic_sd"), cv=$(cv3 "$generic_median" "$generic_sd"))"
+        PASSED=$((PASSED+1))
+    else
+        INFO "xdpgeneric attach failed; skipping"
+    fi
+    detach_xdp "$iface"
+    sleep 0.3
+
+    # ── xdpdrv ────────────────────────────────────────────────────────
+    HDR "Guard in xdpdrv on $iface"
+    local drv_median="0.000"
+    local drv_sd="0.000"
+    if attach_xdp "$iface" "xdpdrv"; then
+        OK "attached (xdpdrv)"
+        PASSED=$((PASSED+1))
+        sudo bpftool net show dev "$iface" | RAW
+
+        local drv_runs=()
+        for i in $(seq 1 "$RUNS"); do
+            STEP "xdpdrv run $i/$RUNS"
+            mbps=$(run_iperf_once "${prefix}-drv-${i}")
+            INFO "throughput: $(fmt3 "$mbps") Mbits/sec"
+            drv_runs+=("$mbps")
+        done
+        drv_median=$(printf '%s\n' "${drv_runs[@]}" | median3)
+        drv_sd=$(printf '%s\n' "${drv_runs[@]}" | stdev3)
+        OK "xdpdrv median: $(fmt3 "$drv_median") Mbits/sec (sd=$(fmt3 "$drv_sd"), cv=$(cv3 "$drv_median" "$drv_sd"))"
+        PASSED=$((PASSED+1))
+    else
+        INFO "xdpdrv not supported on $iface (expected for lo/Wi-Fi); skipping"
+    fi
+    detach_xdp "$iface"
+
+    # ── comparison ────────────────────────────────────────────────────
+    HDR "Comparison for $iface"
+    printf "\n  %-24s %-14s %-14s %-12s\n" \
+        "Configuration" "Median (Mbps)" "Std Dev (Mbps)" "vs baseline"
+    printf "  %-24s %-14s %-14s %-12s\n" \
+        "────────────────────────" "──────────────" "──────────────" "────────────"
+    printf "  %-24s %-14s %-14s %-12s\n" \
+        "Baseline (no XDP)" \
+        "$(fmt3 "$baseline_median")" "$(fmt3 "$baseline_sd")" "—"
+    if awk -v g="$generic_median" 'BEGIN{ exit !(g > 0) }'; then
+        printf "  %-24s %-14s %-14s %-12s\n" \
+            "xdpgeneric" \
+            "$(fmt3 "$generic_median")" "$(fmt3 "$generic_sd")" \
+            "$(pct3 "$baseline_median" "$generic_median")"
+    fi
+    if awk -v d="$drv_median" 'BEGIN{ exit !(d > 0) }'; then
+        printf "  %-24s %-14s %-14s %-12s\n" \
+            "xdpdrv (native)" \
+            "$(fmt3 "$drv_median")" "$(fmt3 "$drv_sd")" \
+            "$(pct3 "$baseline_median" "$drv_median")"
+    fi
+    echo
+}
+
+# ── preconditions ─────────────────────────────────────────────────────────
+HDR "0. Preconditions"
+
+STEP "Check iperf3 is installed"
+if command -v iperf3 >/dev/null 2>&1; then
+    OK "iperf3 found: $(iperf3 --version 2>&1 | head -1)"
+    PASSED=$((PASSED+1))
+else
+    FAIL "iperf3 not found — install it (apt install iperf3)"
+    exit 1
+fi
+
+STEP "Check the guard is installed and pinned"
+if sudo test -e "$PROG_PIN"; then
+    OK "program pin present: $PROG_PIN"
+    PASSED=$((PASSED+1))
+else
+    FAIL "program pin missing: $PROG_PIN — run ./install first"
+    exit 1
+fi
+
+STEP "Check the target interface(s)"
+if (( TEST_BOTH )); then
+    for ifc in lo veth0; do
+        if ip link show "$ifc" >/dev/null 2>&1; then
+            OK "interface exists: $ifc"
+            PASSED=$((PASSED+1))
+        else
+            FAIL "interface not found: $ifc"
+        fi
+    done
+else
+    if ip link show "$TEST_IFACE" >/dev/null 2>&1; then
+        OK "interface exists: $TEST_IFACE"
+        PASSED=$((PASSED+1))
+    else
+        FAIL "interface not found: $TEST_IFACE"
+        exit 1
+    fi
+fi
+
+INFO "test mode:       $IPERF_MODE"
+INFO "iperf3 server:   $IPERF_SERVER:$IPERF_PORT"
+INFO "duration:        ${IPERF_DURATION}s, streams: $IPERF_STREAMS, runs: $RUNS"
+if [[ "$IPERF_MODE" == "public" ]]; then
+    INFO "public server note: only one connection at a time; the script retries on 'server busy'"
+fi
+
+# ── run ───────────────────────────────────────────────────────────────────
+if (( TEST_BOTH )); then
+    run_test_for_iface lo lo
+    run_test_for_iface veth0 veth0
+else
+    run_test_for_iface "$TEST_IFACE" "$TEST_IFACE"
+fi
+
+# ── summary ───────────────────────────────────────────────────────────────
+HDR "Performance summary"
+
+TOTAL=$((PASSED + FAILED))
+printf "  ${BOLD}Checks:${N} %d   ${G}passed: %d${N}   " "$TOTAL" "$PASSED"
+if (( FAILED > 0 )); then
+    printf "${R}failed: %d${N}\n" "$FAILED"
+else
+    printf "${G}failed: 0${N}\n"
+fi
+
+if (( FAILED == 0 )); then
+    printf "\n  ${BOLD}${G}PERFORMANCE TEST PASSED${N}\n\n"
+    exit 0
+else
+    printf "\n  ${BOLD}${R}SOME CHECKS FAILED${N}\n\n"
+    exit 1
+fi
