@@ -2,83 +2,196 @@
 #
 # install-service
 #
-# Install the systemd units for the CVE-2026-98432 XDP guard, deploy the
-# whitelist, and enable both the loader and the daemon.
+# Install the systemd units and udev rule for the CVE-2026-98432 XDP
+# guard, deploy the whitelist, and enable both the loader and the
+# daemon.
 #
-# Unit files and whitelist.conf are read from ./services/ next to this
-# script. Run once after the repository binaries have been built and
-# deployed (./build, sudo ./install) and before you reboot. Requires root.
+# This script writes the unit files inline (heredocs) rather than
+# reading them from ./services/. The reason is portability: the units
+# reference paths that are fixed at the package level, and keeping
+# them inline means one file to deploy instead of five.
 #
-# Idempotent: safe to run repeatedly. Resets failed unit state so a
-# previous bad attempt doesn't block a clean re-run.
+# The guard object is named after the target kernel:
+#     cve_2026_98432_guard-k<major>.<minor>.o
+# so multiple kernel versions can coexist in /etc/cve-2026-98432-guard/.
+# The sanity check below resolves the running kernel version and looks
+# for the matching object.
 #
-# Note: this script does NOT manage a systemd mount unit for bpffs.
-# Modern systemd refuses to manage API filesystems via .mount units
-# ("bad unit file setting"). The install script mounts bpffs itself
-# (mkdir -p /sys/fs/bpf; mountpoint -q || mount -t bpf bpf /sys/fs/bpf),
-# which works on every distribution regardless of systemd version.
+# Run once after ./build && sudo ./install. Requires root.
+# Idempotent: safe to run repeatedly.
 
 set -euo pipefail
 
 # --- paths ---------------------------------------------------------------
-SRC_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-SVC_DIR="$SRC_DIR/services"
-
 GUARD_DIR="/etc/cve-2026-98432-guard"
 UNIT_DIR="/etc/systemd/system"
+UDEV_DIR="/etc/udev/rules.d"
 
 LOADER_UNIT="mtcp-guard-load.service"
 DAEMON_UNIT="mtcp-guardd.service"
+UDEV_RULE="90-mtcp-guard-attach.rules"
+SYSTEMD_BPF_MOUNT="sys-fs-bpf.mount"
 
-# --- sanity --------------------------------------------------------------
-if [[ ! -d "$SVC_DIR" ]]; then
-    echo "[-] services directory not found: $SVC_DIR" >&2
+# --- resolve the kernel-specific object ----------------------------------
+KERNEL_MM="$(uname -r | sed -nE 's/^([0-9]+)\.([0-9]+).*/\1.\2/p')"
+if [[ -z "$KERNEL_MM" ]]; then
+    echo "[-] could not parse running kernel version from uname -r" >&2
     exit 1
 fi
 
-for f in "$LOADER_UNIT" "$DAEMON_UNIT" "whitelist.conf"; do
-    if [[ ! -r "$SVC_DIR/$f" ]]; then
-        echo "[-] missing source file: $SVC_DIR/$f" >&2
-        exit 1
-    fi
-done
+OBJECT="$GUARD_DIR/cve_2026_98432_guard-k${KERNEL_MM}.o"
 
-if [[ ! -r "$GUARD_DIR/cve_2026_98432_guard.o" ]]; then
-    echo "[-] $GUARD_DIR/cve_2026_98432_guard.o not found." >&2
-    echo "    Run ./build && sudo ./install first." >&2
+if [[ ! -r "$OBJECT" ]]; then
+    echo "[-] no guard object for running kernel $KERNEL_MM" >&2
+    echo "    expected: $OBJECT" >&2
+    echo "    available in $GUARD_DIR:" >&2
+    ls -1 "$GUARD_DIR"/cve_2026_98432_guard-k*.o 2>/dev/null \
+        | sed 's/^/      /' >&2 || echo "      (none)" >&2
+    echo "    run ./build --kernel $KERNEL_MM && sudo ./install first." >&2
     exit 1
 fi
 
-# --- deploy units --------------------------------------------------------
-echo "[+] ensuring $GUARD_DIR exists"
-sudo install -d -m 0755 "$GUARD_DIR"
+if [[ ! -x "$GUARD_DIR/install" ]]; then
+    echo "[-] $GUARD_DIR/install not found or not executable." >&2
+    echo "    run ./build && sudo ./install first." >&2
+    exit 1
+fi
 
-echo "[+] installing systemd units into $UNIT_DIR"
-sudo install -m 0644 "$SVC_DIR/$LOADER_UNIT" "$UNIT_DIR/$LOADER_UNIT"
-sudo install -m 0644 "$SVC_DIR/$DAEMON_UNIT" "$UNIT_DIR/$DAEMON_UNIT"
+if [[ ! -x "$GUARD_DIR/mtcp-guardd" ]]; then
+    echo "[-] $GUARD_DIR/mtcp-guardd not found or not executable." >&2
+    echo "    run ./build && sudo ./install first." >&2
+    exit 1
+fi
 
-if [[ -e "$GUARD_DIR/whitelist.conf" ]]; then
+echo "[+] running kernel: $KERNEL_MM"
+echo "[+] guard object:   $OBJECT"
+
+# --- ensure bpffs is mounted now, and by systemd at boot -----------------
+echo "[+] ensuring $SYSTEMD_BPF_MOUNT exists"
+sudo tee "$UNIT_DIR/$SYSTEMD_BPF_MOUNT" >/dev/null <<'EOF'
+[Unit]
+Description=BPF filesystem
+Documentation=man:mount(8)
+DefaultDependencies=no
+Before=local-fs.target
+After=systemd-remount-fs.service
+ConditionPathExists=/sys/fs
+
+[Mount]
+What=bpf
+Where=/sys/fs/bpf
+Type=bpf
+Options=rw,nosuid,nodev,noexec,relatime,mode=700
+EOF
+
+# --- loader unit ---------------------------------------------------------
+echo "[+] writing $LOADER_UNIT"
+sudo tee "$UNIT_DIR/$LOADER_UNIT" >/dev/null <<'EOF'
+[Unit]
+Description=CVE-2026-98432 IPv4 TCP Options XDP Guard
+Documentation=file:/etc/cve-2026-98432-guard/README.md
+Wants=systemd-udev-settle.service
+After=systemd-udev-settle.service
+Before=network.target
+Wants=sys-fs-bpf.mount
+After=sys-fs-bpf.mount
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/etc/cve-2026-98432-guard
+ExecStartPre=/usr/bin/test -d /etc/cve-2026-98432-guard
+ExecStartPre=/usr/bin/test -x /etc/cve-2026-98432-guard/install
+ExecStart=/etc/cve-2026-98432-guard/install
+TimeoutStartSec=60
+TimeoutStopSec=30
+Restart=no
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# --- daemon unit ---------------------------------------------------------
+echo "[+] writing $DAEMON_UNIT"
+sudo tee "$UNIT_DIR/$DAEMON_UNIT" >/dev/null <<'EOF'
+[Unit]
+Description=CVE-2026-98432 IPv4 TCP Options XDP Guard (event daemon)
+Documentation=file:/etc/cve-2026-98432-guard/README.md
+Requires=mtcp-guard-load.service
+After=mtcp-guard-load.service
+ConditionPathExists=/sys/fs/bpf/cve_2026_98432_events
+
+[Service]
+Type=simple
+ExecStart=/etc/cve-2026-98432-guard/mtcp-guardd
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=2s
+
+LogRateLimitIntervalSec=30
+LogRateLimitBurst=5000
+
+RuntimeDirectory=mtcp-guardd
+RuntimeDirectoryMode=0755
+
+StandardOutput=journal
+StandardError=journal
+
+NoNewPrivileges=yes
+ProtectSystem=full
+ProtectHome=yes
+PrivateTmp=yes
+ReadWritePaths=/sys/fs/bpf /run
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# --- udev rule -----------------------------------------------------------
+echo "[+] writing $UDEV_RULE"
+sudo tee "$UDEV_DIR/$UDEV_RULE" >/dev/null <<'EOF'
+# Re-run the CVE-2026-98432 XDP guard loader when a network interface
+# appears. The loader is idempotent: it skips interfaces that already
+# have the guard attached and only attaches to the new one.
+ACTION=="add", SUBSYSTEM=="net", RUN+="/bin/systemctl restart --no-block mtcp-guard-load.service"
+EOF
+
+# --- deploy whitelist if absent ------------------------------------------
+if [[ -f "$GUARD_DIR/whitelist.conf" ]]; then
     echo "[+] $GUARD_DIR/whitelist.conf already exists; leaving it untouched"
-else
-    echo "[+] installing whitelist.conf into $GUARD_DIR"
-    sudo install -m 0644 "$SVC_DIR/whitelist.conf" \
-        "$GUARD_DIR/whitelist.conf"
 fi
 
-# --- reload + reset ------------------------------------------------------
+# --- reload systemd + udev -----------------------------------------------
 echo "[+] systemctl daemon-reload"
 sudo systemctl daemon-reload
 
-# Clear any failed state from a previous attempt.
+echo "[+] udevadm control --reload-rules"
+sudo udevadm control --reload-rules || true
+
 sudo systemctl reset-failed "$LOADER_UNIT" 2>/dev/null || true
 sudo systemctl reset-failed "$DAEMON_UNIT" 2>/dev/null || true
+sudo systemctl reset-failed "$SYSTEMD_BPF_MOUNT" 2>/dev/null || true
 
-# Also clear a stale/failed mount unit from the previous attempt so
-# systemd doesn't try to start it via the loader's Requires= dependency.
-# The loader unit must NOT reference sys-fs-bpf.mount anymore.
-sudo systemctl reset-failed sys-fs-bpf.mount 2>/dev/null || true
-sudo rm -f /etc/systemd/system/sys-fs-bpf.mount
+# If a previous install created a *stale* mount unit at a different
+# path (from an earlier version), remove it so it doesn't shadow the
+# new one.
+sudo rm -f /etc/systemd/system/sys-fs-bpf.mount.service 2>/dev/null || true
 sudo systemctl daemon-reload
+
+# --- enable bpffs mount unit (best-effort) -------------------------------
+echo "[+] starting $SYSTEMD_BPF_MOUNT (best-effort)"
+if ! sudo systemctl start "$SYSTEMD_BPF_MOUNT" 2>/dev/null; then
+    echo "[!] systemd could not start $SYSTEMD_BPF_MOUNT."
+    echo "    Modern systemd may reject manually-provided API filesystem"
+    echo "    mount units. The loader's install script mounts bpffs itself,"
+    echo "    so this is not fatal."
+fi
+
+if mountpoint -q /sys/fs/bpf; then
+    echo "[+] /sys/fs/bpf is mounted"
+else
+    echo "[!] /sys/fs/bpf not mounted yet; the loader will mount it"
+fi
 
 # --- loader --------------------------------------------------------------
 echo "[+] enabling and starting $LOADER_UNIT"
@@ -88,13 +201,10 @@ if ! sudo systemctl enable --now "$LOADER_UNIT"; then
     exit 1
 fi
 
-# Verify the maps are actually pinned before starting the daemon.
-# The loader's ExecStart (/etc/.../install) mounts bpffs itself if needed.
 if ! sudo test -e /sys/fs/bpf/cve_2026_98432_events; then
     echo "[-] events map not pinned after loader start." >&2
     echo "    Check: journalctl -u $LOADER_UNIT --no-pager" >&2
     echo "    Check: sudo ls -la /sys/fs/bpf/" >&2
-    echo "    Check: mountpoint /sys/fs/bpf" >&2
     exit 1
 fi
 
@@ -116,3 +226,8 @@ echo
 echo "[+] done. To verify the guard is live:"
 echo "    sudo $GUARD_DIR/mtcp-guard-ctl stats"
 echo "    journalctl -u $DAEMON_UNIT -f"
+echo
+echo "[+] udev rule installed: $UDEV_DIR/$UDEV_RULE"
+echo "    Network interfaces added after boot will be attached automatically"
+echo "    by re-running the loader unit. Check with:"
+echo "    journalctl -u $LOADER_UNIT -f"
